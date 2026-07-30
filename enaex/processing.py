@@ -160,7 +160,7 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
 
     gps["timestamp_parsed"] = gps["timestamp"].map(parse_date)
     gps["_has_timestamp"] = gps["timestamp_parsed"].notna().astype(int)
-    completeness_fields = ["equipment", "plate", "vin", "faena", "brand", "model", "hours", "status"]
+    completeness_fields = ["equipment", "plate", "vin", "faena", "place", "brand", "model", "hours", "status"]
     gps["_completeness"] = gps[completeness_fields].apply(
         lambda row: sum(not is_empty(value) for value in row), axis=1
     )
@@ -317,6 +317,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "dgmn": dgmn_date,
                 "dgmn_quality": dgmn_quality,
                 "gps_faena": clean_display(gps_row.get("faena")) if gps_row is not None else "No reporta GPS",
+                "gps_place": clean_display(gps_row.get("place")) if gps_row is not None else "N/A",
                 "gps_contract": str(gps_row.get("canonical_contract")) if gps_row is not None else "Sin faena",
                 "gps_state": clean_display(gps_row.get("status")) if gps_row is not None else "N/A",
                 "gps_hours": clean_display(gps_row.get("hours")) if gps_row is not None else "N/A",
@@ -373,6 +374,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "dgmn": pd.NaT,
                 "dgmn_quality": "missing",
                 "gps_faena": clean_display(gps_row.get("faena")),
+                "gps_place": clean_display(gps_row.get("place")),
                 "gps_contract": str(gps_row.get("canonical_contract")),
                 "gps_state": clean_display(gps_row.get("status")),
                 "gps_hours": clean_display(gps_row.get("hours")),
@@ -618,34 +620,82 @@ def apply_movement_plan_to_equipment(
     return result
 
 
-def _active_movements_on_day(movements: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
-    if movements.empty:
-        return movements
-    day = pd.Timestamp(day).normalize()
-    active = movements[
-        movements["start_date"].notna()
-        & (movements["start_date"] <= day)
-        & (movements["end_date"].isna() | (movements["end_date"] >= day))
-        & ~movements["status"].map(is_terminal_status)
-        & movements["workshop_canonical"].isin(WORKSHOP_CAPACITY)
-    ].copy()
-    if not active.empty:
-        active = active.sort_values(
-            ["start_date", "update_date", "_global_order"], na_position="first"
-        ).drop_duplicates("entity_id", keep="last")
-    return active
+EXTERNAL_WORKSHOPS = "TALLERES EXTERNOS"
 
 
-def build_workshop_capacity(
-    movements: pd.DataFrame,
-    today: pd.Timestamp | None = None,
-) -> pd.DataFrame:
-    today = (today or pd.Timestamp.now()).normalize()
-    active = _active_movements_on_day(movements, today)
+def classify_current_workshop(value: Any) -> str | None:
+    """Clasifica la columna Lugar de la API como taller conocido, externo o no-taller."""
+    text = normalize_text(value)
+    if not text:
+        return None
+
+    non_workshop_values = {
+        "faena", "en faena", "operacion", "operativo", "ruta", "en ruta",
+        "transito", "en transito", "sin informacion", "sin ubicacion",
+    }
+    if text in non_workshop_values or text.startswith("faena "):
+        return None
+
+    canonical = normalize_workshop(value)
+    if canonical in WORKSHOP_CAPACITY:
+        return canonical
+    return EXTERNAL_WORKSHOPS
+
+
+def build_current_workshops(equipment: pd.DataFrame) -> pd.DataFrame:
+    """Snapshot actual de talleres usando exclusivamente la columna Lugar de la API."""
+    columns = [
+        "entity_id", "equipment", "plate", "current_place", "workshop_bucket",
+        "external_workshop", "gps_state", "gps_faena", "gps_last_update",
+    ]
+    if equipment.empty or "gps_place" not in equipment.columns:
+        return pd.DataFrame(columns=columns)
 
     rows: list[dict[str, Any]] = []
+    for _, row in equipment.iterrows():
+        current_place = clean_display(row.get("gps_place"), default="")
+        bucket = classify_current_workshop(current_place)
+        if bucket is None:
+            continue
+        rows.append(
+            {
+                "entity_id": str(row.get("entity_id")),
+                "equipment": clean_display(row.get("equipment")),
+                "plate": clean_display(row.get("plate")),
+                "current_place": current_place,
+                "workshop_bucket": bucket,
+                "external_workshop": current_place if bucket == EXTERNAL_WORKSHOPS else "",
+                "gps_state": clean_display(row.get("gps_state")),
+                "gps_faena": clean_display(row.get("gps_faena")),
+                "gps_last_update": row.get("gps_last_update"),
+            }
+        )
+
+    snapshot = pd.DataFrame(rows, columns=columns)
+    if snapshot.empty:
+        return snapshot
+    return (
+        snapshot.sort_values(["workshop_bucket", "equipment"])
+        .drop_duplicates("entity_id", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def _planned_workshop_bucket(value: Any) -> str | None:
+    text = normalize_text(value)
+    if not text or text in {"n a", "na", "faena"}:
+        return None
+    canonical = normalize_workshop(value)
+    if canonical in WORKSHOP_CAPACITY:
+        return canonical
+    return EXTERNAL_WORKSHOPS
+
+
+def build_workshop_capacity(current_workshops: pd.DataFrame) -> pd.DataFrame:
+    """Capacidad actual basada en la ubicación Lugar reportada por la API."""
+    rows: list[dict[str, Any]] = []
     for workshop, limit in WORKSHOP_CAPACITY.items():
-        occupied = int((active["workshop_canonical"] == workshop).sum()) if not active.empty else 0
+        occupied = int((current_workshops["workshop_bucket"] == workshop).sum()) if not current_workshops.empty else 0
         if occupied > limit:
             status = "Sobrepasado"
         elif occupied == limit:
@@ -661,77 +711,207 @@ def build_workshop_capacity(
                 "status": status,
             }
         )
+
+    external_count = (
+        int((current_workshops["workshop_bucket"] == EXTERNAL_WORKSHOPS).sum())
+        if not current_workshops.empty else 0
+    )
+    if external_count:
+        rows.append(
+            {
+                "workshop": EXTERNAL_WORKSHOPS,
+                "occupied": external_count,
+                "limit": pd.NA,
+                "available": pd.NA,
+                "status": "Sin límite configurado",
+            }
+        )
     return pd.DataFrame(rows)
+
+
+def _apply_movement_events(
+    state: dict[str, str],
+    movements: pd.DataFrame,
+    day: pd.Timestamp,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Aplica bajadas primero (peak conservador) y luego subidas para obtener el cierre."""
+    if movements.empty:
+        return state.copy(), state.copy()
+
+    day = pd.Timestamp(day).normalize()
+    working = state.copy()
+    starts = movements[movements["start_date"].eq(day)].sort_values(["equipment", "_global_order"])
+    for _, row in starts.iterrows():
+        if is_terminal_status(row.get("status")):
+            continue
+        bucket = _planned_workshop_bucket(row.get("workshop"))
+        if bucket:
+            working[str(row.get("entity_id"))] = bucket
+
+    peak_state = working.copy()
+    ends = movements[movements["end_date"].eq(day)].sort_values(["equipment", "_global_order"])
+    for _, row in ends.iterrows():
+        working.pop(str(row.get("entity_id")), None)
+    return peak_state, working
 
 
 def build_weekly_workshop_projection(
     movements: pd.DataFrame,
+    current_workshops: pd.DataFrame | None = None,
     week_start: pd.Timestamp | None = None,
+    today: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """Proyecta ocupación diaria, peak y cierre de cada taller para una semana."""
-    selected = (week_start or pd.Timestamp.now()).normalize()
+    """
+    Proyecta capacidad desde el snapshot actual de la API.
+
+    La columna Lugar es la verdad para la ocupación de hoy. Los movimientos futuros de
+    la hoja Mov. equipos agregan bajadas y descuentan subidas. De esta forma, un camión
+    que ya está en taller se cuenta aunque no tenga una bajada dentro de la semana.
+    """
+    today = (today or pd.Timestamp.now()).normalize()
+    selected = (week_start or today).normalize()
     monday = selected - pd.Timedelta(days=int(selected.weekday()))
     sunday = monday + pd.Timedelta(days=6)
-    previous_day = monday - pd.Timedelta(days=1)
-    days = pd.date_range(monday, sunday, freq="D")
+
+    current_workshops = current_workshops if current_workshops is not None else pd.DataFrame()
+    state: dict[str, str] = {}
+    name_by_entity: dict[str, str] = {}
+    if not current_workshops.empty:
+        for _, row in current_workshops.iterrows():
+            entity_id = str(row.get("entity_id"))
+            state[entity_id] = str(row.get("workshop_bucket"))
+            name_by_entity[entity_id] = clean_display(row.get("equipment"), default=entity_id)
+
+    if not movements.empty:
+        for _, row in movements.iterrows():
+            entity_id = str(row.get("entity_id"))
+            name_by_entity.setdefault(entity_id, clean_display(row.get("equipment"), default=entity_id))
+
+    # La API ya representa la situación de hoy. Para no duplicar movimientos del mismo día,
+    # la simulación comienza mañana y avanza hasta el cierre de la semana seleccionada.
+    simulation_day = today + pd.Timedelta(days=1)
+    if simulation_day <= sunday:
+        while simulation_day < monday:
+            _, state = _apply_movement_events(state, movements, simulation_day)
+            simulation_day += pd.Timedelta(days=1)
+
+    opening_state = state.copy()
+    daily_snapshots: list[tuple[pd.Timestamp, dict[str, str], dict[str, str]]] = []
+
+    for day in pd.date_range(max(monday, today), sunday, freq="D"):
+        day = pd.Timestamp(day).normalize()
+        if day <= today:
+            peak_state = state.copy()
+            closing_state = state.copy()
+        else:
+            peak_state, closing_state = _apply_movement_events(state, movements, day)
+            state = closing_state.copy()
+        daily_snapshots.append((day, peak_state, closing_state))
+
+    if not daily_snapshots:
+        daily_snapshots.append((today, state.copy(), state.copy()))
+
+    movement_buckets: set[str] = set()
+    if not movements.empty:
+        movement_buckets = {
+            bucket
+            for bucket in movements["workshop"].map(_planned_workshop_bucket).tolist()
+            if bucket
+        }
+    buckets = list(WORKSHOP_CAPACITY.keys())
+    if (
+        EXTERNAL_WORKSHOPS in set(state.values())
+        or EXTERNAL_WORKSHOPS in movement_buckets
+        or (not current_workshops.empty and (current_workshops["workshop_bucket"] == EXTERNAL_WORKSHOPS).any())
+    ):
+        buckets.append(EXTERNAL_WORKSHOPS)
 
     rows: list[dict[str, Any]] = []
-    for workshop, limit in WORKSHOP_CAPACITY.items():
-        opening_active = _active_movements_on_day(movements, previous_day)
-        opening = int((opening_active["workshop_canonical"] == workshop).sum()) if not opening_active.empty else 0
+    for workshop in buckets:
+        limit = WORKSHOP_CAPACITY.get(workshop)
+        current_ids = {entity for entity, bucket in (
+            (str(row.get("entity_id")), str(row.get("workshop_bucket")))
+            for _, row in current_workshops.iterrows()
+        ) if bucket == workshop} if not current_workshops.empty else set()
+        current = len(current_ids)
+        opening_ids = {entity for entity, bucket in opening_state.items() if bucket == workshop}
 
-        workshop_movements = movements[
-            movements["workshop_canonical"].eq(workshop)
-        ].copy() if not movements.empty else pd.DataFrame()
+        workshop_movements = movements.copy() if not movements.empty else pd.DataFrame()
+        if not workshop_movements.empty:
+            workshop_movements["_projection_bucket"] = workshop_movements["workshop"].map(_planned_workshop_bucket)
+            workshop_movements = workshop_movements[workshop_movements["_projection_bucket"].eq(workshop)]
 
         downs = 0
         ups = 0
         if not workshop_movements.empty:
-            downs = int(
-                workshop_movements.loc[
-                    workshop_movements["start_date"].between(monday, sunday, inclusive="both"),
-                    "entity_id",
-                ].nunique()
-            )
-            ups = int(
-                workshop_movements.loc[
-                    workshop_movements["end_date"].between(monday, sunday, inclusive="both"),
-                    "entity_id",
-                ].nunique()
-            )
+            downs = int(workshop_movements.loc[
+                workshop_movements["start_date"].between(monday, sunday, inclusive="both"),
+                "entity_id",
+            ].nunique())
+            ups = int(workshop_movements.loc[
+                workshop_movements["end_date"].between(monday, sunday, inclusive="both"),
+                "entity_id",
+            ].nunique())
 
-        daily_counts: list[tuple[pd.Timestamp, int, list[str]]] = []
-        for day in days:
-            active = _active_movements_on_day(movements, day)
-            workshop_active = active[active["workshop_canonical"].eq(workshop)] if not active.empty else active
-            names = sorted(workshop_active["equipment"].astype(str).unique().tolist()) if not workshop_active.empty else []
-            daily_counts.append((pd.Timestamp(day), len(names), names))
+        peak_day = daily_snapshots[0][0]
+        peak_ids: set[str] = set()
+        closing_ids: set[str] = set()
+        for day, peak_state, closing_state in daily_snapshots:
+            day_peak_ids = {entity for entity, bucket in peak_state.items() if bucket == workshop}
+            if len(day_peak_ids) > len(peak_ids):
+                peak_ids = day_peak_ids
+                peak_day = day
+            closing_ids = {entity for entity, bucket in closing_state.items() if bucket == workshop}
 
-        peak_day, peak, peak_equipment = max(daily_counts, key=lambda item: item[1])
-        closing = daily_counts[-1][1]
-        if peak > limit:
+        peak = len(peak_ids)
+        closing = len(closing_ids)
+        if limit is None:
+            status = "Sin límite configurado"
+            available_at_peak: int | None = None
+            over_capacity = 0
+        elif peak > limit:
             status = "Sobrepasado"
+            available_at_peak = 0
+            over_capacity = peak - limit
         elif peak == limit:
             status = "Al límite"
+            available_at_peak = 0
+            over_capacity = 0
         else:
             status = "Con espacio"
+            available_at_peak = limit - peak
+            over_capacity = 0
+
+        external_locations: list[str] = []
+        if workshop == EXTERNAL_WORKSHOPS and not current_workshops.empty:
+            external_locations = sorted(
+                current_workshops.loc[
+                    current_workshops["workshop_bucket"].eq(EXTERNAL_WORKSHOPS),
+                    "current_place",
+                ].dropna().astype(str).unique().tolist()
+            )
 
         rows.append(
             {
                 "workshop": workshop,
-                "limit": limit,
-                "opening": opening,
+                "limit": limit if limit is not None else pd.NA,
+                "current": current,
+                "opening": len(opening_ids),
                 "downs": downs,
                 "ups": ups,
                 "peak": peak,
                 "peak_date": peak_day,
                 "closing": closing,
-                "available_at_peak": max(limit - peak, 0),
-                "over_capacity": max(peak - limit, 0),
+                "available_at_peak": available_at_peak if available_at_peak is not None else pd.NA,
+                "over_capacity": over_capacity,
                 "status": status,
-                "peak_equipment": peak_equipment,
+                "current_equipment": sorted(name_by_entity.get(entity, entity) for entity in current_ids),
+                "peak_equipment": sorted(name_by_entity.get(entity, entity) for entity in peak_ids),
+                "closing_equipment": sorted(name_by_entity.get(entity, entity) for entity in closing_ids),
+                "external_locations": external_locations,
                 "week_start": monday,
                 "week_end": sunday,
+                "snapshot_date": today,
             }
         )
     return pd.DataFrame(rows)
@@ -861,7 +1041,8 @@ def build_application_data(
     movements = build_movements(history, equipment)
     equipment = apply_movement_plan_to_equipment(equipment, movements)
     certifications = build_certifications(equipment)
-    workshop_capacity = build_workshop_capacity(movements)
+    current_workshops = build_current_workshops(equipment)
+    workshop_capacity = build_workshop_capacity(current_workshops)
     contracts = build_contracts(gps)
 
     diagnostics: dict[str, Any] = {}
@@ -873,6 +1054,13 @@ def build_application_data(
             "equipment_total": len(equipment),
             "history_rows_canonical": len(history),
             "movement_rows": len(movements),
+            "current_workshop_equipment": len(current_workshops),
+            "external_workshops": sorted(
+                current_workshops.loc[
+                    current_workshops.get("workshop_bucket", pd.Series(dtype="object")).eq(EXTERNAL_WORKSHOPS),
+                    "current_place",
+                ].dropna().astype(str).unique().tolist()
+            ) if not current_workshops.empty else [],
             "movement_source_sheets": sorted(movements["source"].dropna().unique().tolist()) if not movements.empty else [],
             "settings": {
                 **asdict(settings),
@@ -890,6 +1078,7 @@ def build_application_data(
         certifications=certifications,
         contracts=contracts,
         workshop_capacity=workshop_capacity,
+        current_workshops=current_workshops,
         search_aliases=search_aliases,
         diagnostics=diagnostics,
         errors=list(source_errors or []),

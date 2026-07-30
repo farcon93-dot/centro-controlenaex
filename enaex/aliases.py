@@ -97,6 +97,11 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "nombre faena", "nombre_faena", "faena", "contrato", "zona nombre", "ubicacion",
         "ubicación",
     ),
+    "place": (
+        "lugar", "lugar actual", "ubicacion actual", "ubicación actual",
+        "ubicacion fisica", "ubicación física", "taller actual", "localizacion",
+        "localización",
+    ),
     "brand": ("marca nombre", "marca_nombre", "marca", "fabricante"),
     "model": ("modelo nombre", "modelo_nombre", "modelo"),
     "hours": ("horas ult", "horas_ult", "horometro", "horómetro", "horas"),

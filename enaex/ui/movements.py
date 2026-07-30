@@ -8,8 +8,10 @@ from enaex.configuration import Settings
 from enaex.models import ApplicationData
 from enaex.normalize import format_date
 from enaex.processing import (
+    EXTERNAL_WORKSHOPS,
     build_rebalancing_recommendations,
     build_weekly_workshop_projection,
+    classify_current_workshop,
 )
 
 
@@ -33,22 +35,79 @@ def _movement_display(frame: pd.DataFrame, date_column: str, destination_column:
     )
 
 
-def _projection_display(projection: pd.DataFrame) -> pd.DataFrame:
-    display = projection[
-        ["workshop", "limit", "opening", "downs", "ups", "peak", "closing", "status"]
-    ].copy()
-    return display.rename(
+def _current_detail(current_workshops: pd.DataFrame, workshop: str) -> pd.DataFrame:
+    if current_workshops.empty:
+        return pd.DataFrame()
+    detail = current_workshops[current_workshops["workshop_bucket"].eq(workshop)].copy()
+    if detail.empty:
+        return detail
+    columns = ["equipment", "plate", "current_place", "gps_state", "gps_faena"]
+    display = detail[columns].rename(
         columns={
-            "workshop": "Taller",
-            "limit": "Capacidad máxima",
-            "opening": "Equipos al inicio",
-            "downs": "Bajan en la semana",
-            "ups": "Suben en la semana",
-            "peak": "Máximo proyectado",
-            "closing": "Cierre de semana",
-            "status": "Estado",
+            "equipment": "Equipo",
+            "plate": "Patente",
+            "current_place": "Lugar API",
+            "gps_state": "Estado",
+            "gps_faena": "Faena",
         }
     )
+    return display.sort_values("Equipo").reset_index(drop=True)
+
+
+def _planned_detail(
+    movements: pd.DataFrame,
+    workshop: str,
+    week_start: pd.Timestamp,
+    week_end: pd.Timestamp,
+) -> pd.DataFrame:
+    if movements.empty:
+        return pd.DataFrame()
+    frame = movements.copy()
+    frame["_bucket"] = frame["workshop"].map(classify_current_workshop)
+    frame = frame[frame["_bucket"].eq(workshop)]
+    if frame.empty:
+        return pd.DataFrame()
+    mask = (
+        frame["start_date"].between(week_start, week_end, inclusive="both")
+        | frame["end_date"].between(week_start, week_end, inclusive="both")
+    )
+    frame = frame.loc[mask, ["equipment", "start_date", "end_date", "workshop", "faena", "comments"]].copy()
+    if frame.empty:
+        return frame
+    frame["start_date"] = frame["start_date"].map(format_date)
+    frame["end_date"] = frame["end_date"].map(format_date)
+    return frame.rename(
+        columns={
+            "equipment": "Equipo",
+            "start_date": "Bajada",
+            "end_date": "Subida",
+            "workshop": "Taller planificado",
+            "faena": "Faena destino",
+            "comments": "Trabajo",
+        }
+    ).sort_values(["Bajada", "Equipo"]).reset_index(drop=True)
+
+
+def _status_icon(status: str) -> str:
+    return {
+        "Sobrepasado": "🔴",
+        "Al límite": "🟡",
+        "Con espacio": "🟢",
+        "Sin límite configurado": "⚪",
+    }.get(status, "⚪")
+
+
+def _compact_label(row: pd.Series) -> str:
+    workshop = str(row["workshop"])
+    current = int(row.get("current", 0))
+    peak = int(row.get("peak", 0))
+    status = str(row.get("status", ""))
+    limit = row.get("limit")
+    if pd.isna(limit):
+        capacity = f"Hoy {current} · Peak {peak}"
+    else:
+        capacity = f"Hoy {current}/{int(limit)} · Peak {peak}/{int(limit)}"
+    return f"{_status_icon(status)} {workshop} · {capacity}"
 
 
 def render_movements_page(
@@ -58,100 +117,144 @@ def render_movements_page(
 ) -> None:
     st.header("📅 Control semanal de Subidas, Bajadas y Capacidad")
     st.caption(
-        "Las fechas de esta pantalla provienen únicamente del Excel de planificación semanal, "
-        "pestaña **Mov. equipos**. Se muestra una sola bajada y una sola subida por camión."
+        "Las bajadas y subidas provienen únicamente de la pestaña **Mov. equipos**. "
+        "La ocupación actual se obtiene desde la columna **Lugar** de la API del sistema de planificación."
     )
 
+    today = pd.Timestamp.now().normalize()
     selected_day = pd.Timestamp(
         st.date_input(
             "Selecciona cualquier día de la semana que deseas analizar",
-            value=pd.Timestamp.now().date(),
+            value=today.date(),
+            min_value=today.date(),
         )
     ).normalize()
     week_start = selected_day - pd.Timedelta(days=int(selected_day.weekday()))
     week_end = week_start + pd.Timedelta(days=6)
-    st.info(f"Semana analizada: **{format_date(week_start)} al {format_date(week_end)}**")
+    st.info(
+        f"Semana analizada: **{format_date(week_start)} al {format_date(week_end)}** · "
+        f"Base actual de talleres: **API al {format_date(today)}**"
+    )
+
+    gps_mapping = data.diagnostics.get("gps_column_mapping", {})
+    if not gps_mapping.get("place"):
+        st.error(
+            "La API respondió, pero no se detectó la columna **Lugar**. "
+            "Abre la barra lateral → Diagnóstico de columnas GPS y verifica que aparezca `place → Lugar`."
+        )
 
     if data.movements.empty:
         st.warning(
             "No se detectaron movimientos válidos en una hoja llamada “Mov. equipos”. "
             "Revisa en la barra lateral → Hojas Excel cargadas que esa pestaña esté presente."
         )
-        return
-
-    date_issues = data.movements[data.movements.get("date_issue", "").astype(str).ne("")]
-    if not date_issues.empty:
-        st.warning(
-            f"Se detectaron {len(date_issues)} equipo(s) con fecha de subida anterior a la bajada. "
-            "Estos registros deben revisarse en Mov. equipos."
-        )
-
-    down = data.movements[
-        data.movements["start_date"].notna()
-        & data.movements["start_date"].between(week_start, week_end, inclusive="both")
-    ].sort_values(["start_date", "equipment"])
-    up = data.movements[
-        data.movements["end_date"].notna()
-        & data.movements["end_date"].between(week_start, week_end, inclusive="both")
-    ].sort_values(["end_date", "equipment"])
-
-    left, right = st.columns(2)
-    with left:
-        st.subheader("📉 Bajan a taller")
-        if down.empty:
-            st.success("No hay bajadas registradas para esta semana.")
-        else:
-            st.dataframe(
-                _movement_display(down, "start_date", "workshop"),
-                hide_index=True,
-                use_container_width=True,
+    else:
+        date_issues = data.movements[data.movements.get("date_issue", "").astype(str).ne("")]
+        if not date_issues.empty:
+            st.warning(
+                f"Se detectaron {len(date_issues)} equipo(s) con fecha de subida anterior a la bajada. "
+                "Estos registros deben revisarse en Mov. equipos."
             )
 
-    with right:
-        st.subheader("⛰️ Suben o se entregan a faena")
-        if up.empty:
-            st.info("No hay subidas registradas para esta semana.")
-        else:
-            st.dataframe(
-                _movement_display(up, "end_date", "faena"),
-                hide_index=True,
-                use_container_width=True,
-            )
+        down = data.movements[
+            data.movements["start_date"].notna()
+            & data.movements["start_date"].between(week_start, week_end, inclusive="both")
+        ].sort_values(["start_date", "equipment"])
+        up = data.movements[
+            data.movements["end_date"].notna()
+            & data.movements["end_date"].between(week_start, week_end, inclusive="both")
+        ].sort_values(["end_date", "equipment"])
+
+        left, right = st.columns(2)
+        with left:
+            st.subheader("📉 Bajan a taller")
+            if down.empty:
+                st.success("No hay bajadas registradas para esta semana.")
+            else:
+                st.dataframe(
+                    _movement_display(down, "start_date", "workshop"),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        with right:
+            st.subheader("⛰️ Suben o se entregan a faena")
+            if up.empty:
+                st.info("No hay subidas registradas para esta semana.")
+            else:
+                st.dataframe(
+                    _movement_display(up, "end_date", "faena"),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
     st.divider()
-    st.subheader("⚖️ Proyección de capacidad de talleres para la semana")
-    projection = build_weekly_workshop_projection(data.movements, week_start)
+    st.subheader("⚖️ Capacidad actual y proyección semanal")
+    st.caption(
+        "Los recuadros son desplegables. Haz clic en un taller para ver los equipos que la API ubica allí hoy "
+        "y sus movimientos programados para la semana."
+    )
 
+    projection = build_weekly_workshop_projection(
+        data.movements,
+        data.current_workshops,
+        week_start,
+        today=today,
+    )
     if projection.empty:
         st.info("No fue posible calcular la proyección de capacidad.")
         return
 
-    st.dataframe(
-        _projection_display(projection),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    columns = st.columns(3)
+    columns = st.columns(4)
     for index, row in projection.iterrows():
-        with columns[index % 3]:
-            label = str(row["workshop"])
-            peak = int(row["peak"])
-            limit = int(row["limit"])
-            closing = int(row["closing"])
-            downs = int(row["downs"])
-            ups = int(row["ups"])
-            status = str(row["status"])
-            detail = (
-                f"Máximo: **{peak}/{limit}** · Cierre: **{closing}**\n\n"
-                f"Bajan: {downs} · Suben: {ups}"
-            )
-            if status == "Sobrepasado":
-                st.error(f"**{label}**\n\n🔴 SOBREPASADO\n\n{detail}")
-            elif status == "Al límite":
-                st.warning(f"**{label}**\n\n🟡 AL LÍMITE\n\n{detail}")
-            else:
-                st.success(f"**{label}**\n\n🟢 CON ESPACIO\n\n{detail}")
+        workshop = str(row["workshop"])
+        with columns[index % 4]:
+            with st.expander(_compact_label(row), expanded=False):
+                current = int(row.get("current", 0))
+                downs = int(row.get("downs", 0))
+                ups = int(row.get("ups", 0))
+                peak = int(row.get("peak", 0))
+                closing = int(row.get("closing", 0))
+                limit = row.get("limit")
+                status = str(row.get("status", ""))
+
+                if pd.isna(limit):
+                    st.caption("Capacidad máxima no configurada para este grupo.")
+                else:
+                    st.caption(f"Capacidad máxima: {int(limit)} · Estado proyectado: {status}")
+                st.markdown(
+                    f"**Hoy:** {current}  ·  **Bajan:** {downs}  ·  **Suben:** {ups}  "
+                    f"·  **Peak:** {peak}  ·  **Cierre:** {closing}"
+                )
+
+                if workshop == EXTERNAL_WORKSHOPS:
+                    locations = row.get("external_locations", []) or []
+                    if locations:
+                        st.caption("Lugares externos detectados: " + ", ".join(map(str, locations)))
+
+                st.markdown("**Equipos actualmente en el taller (API)**")
+                current_detail = _current_detail(data.current_workshops, workshop)
+                if current_detail.empty:
+                    st.write("No hay equipos reportados actualmente.")
+                else:
+                    st.dataframe(
+                        current_detail,
+                        hide_index=True,
+                        use_container_width=True,
+                        height=min(260, 36 * (len(current_detail) + 1) + 4),
+                    )
+
+                st.markdown("**Movimientos programados de la semana**")
+                planned_detail = _planned_detail(data.movements, workshop, week_start, week_end)
+                if planned_detail.empty:
+                    st.write("No hay movimientos programados para este taller.")
+                else:
+                    st.dataframe(
+                        planned_detail,
+                        hide_index=True,
+                        use_container_width=True,
+                        height=min(260, 36 * (len(planned_detail) + 1) + 4),
+                    )
 
     st.divider()
     st.subheader("🧭 Recomendaciones de redistribución")
@@ -161,13 +264,14 @@ def render_movements_page(
             st.warning(recommendation)
     else:
         st.success(
-            "No se proyectan talleres sobre su capacidad máxima durante esta semana. "
-            "Mantén seguimiento de cambios de última hora en Mov. equipos."
+            "No se proyectan talleres configurados sobre su capacidad máxima durante esta semana. "
+            "Mantén seguimiento de cambios de última hora en Mov. equipos y de la columna Lugar de la API."
         )
 
     st.markdown("#### 🤖 Recomendación asistida por IA")
     st.caption(
-        "Gemini no calcula las capacidades: solo analiza las cifras ya calculadas por la app y propone una redistribución breve."
+        "Gemini no calcula las capacidades: analiza el inventario actual informado por Lugar, las bajadas/subidas "
+        "de Mov. equipos y los cupos calculados por la aplicación."
     )
 
     week_key = week_start.strftime("%Y-%m-%d")

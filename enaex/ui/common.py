@@ -24,6 +24,9 @@ CSS = """
     .card-success {background: rgba(23, 111, 72, .30);}
     .metric-note {font-size: .86rem; opacity: .85;}
     .small-muted {color: #98a2b3; font-size: .86rem;}
+    div[data-testid="stExpander"] {border-radius: 8px;}
+    div[data-testid="stExpander"] summary {padding: .45rem .65rem; font-size: .82rem;}
+    div[data-testid="stExpander"] details[open] summary {margin-bottom: .25rem;}
 </style>
 """
 
@@ -131,7 +134,8 @@ def render_equipment_card(row: pd.Series) -> None:
         with gps_col:
             st.markdown("#### 📡 Identificación y GPS")
             st.info(
-                f"📍 **Ubicación GPS:** {row.get('gps_faena', 'N/A')}  |  "
+                f"📍 **Faena GPS:** {row.get('gps_faena', 'N/A')}  |  "
+                f"🏭 **Lugar actual:** {row.get('gps_place', 'N/A')}  |  "
                 f"⚙️ **Estado:** {row.get('gps_state', 'N/A')}"
             )
             c1, c2 = st.columns(2)

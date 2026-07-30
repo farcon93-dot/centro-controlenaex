@@ -4,8 +4,9 @@ import pandas as pd
 
 from enaex.configuration import Settings
 from enaex.data_sources import detect_header_row
-from enaex.normalize import format_date, normalize_identifier, normalize_workshop, parse_date
+from enaex.normalize import format_date, normalize_identifier, normalize_workshop
 from enaex.processing import (
+    EXTERNAL_WORKSHOPS,
     build_application_data,
     build_weekly_workshop_projection,
     canonical_contract,
@@ -24,6 +25,16 @@ def settings() -> Settings:
         gps_timeout_seconds=6,
         gps_workers=4,
     )
+
+
+def gps_row(equipment: str, place: str, order: int = 0, faena: str = "Centinela") -> dict:
+    return {
+        "Equipo": equipment,
+        "Lugar": place,
+        "Faena": faena,
+        "Estado": "OK",
+        "_gps_response_order": order,
+    }
 
 
 def test_identifier_normalization() -> None:
@@ -87,17 +98,7 @@ def test_consolidation_across_sheets_and_latest_values() -> None:
             },
         ]
     )
-    gps = pd.DataFrame(
-        [
-            {
-                "nombre": "Quadra-70",
-                "nombre_faena": "Centinela",
-                "horas_ult": 1234,
-                "Estado_Deducido": "Operativo",
-                "_gps_response_order": 0,
-            }
-        ]
-    )
+    gps = pd.DataFrame([gps_row("Quadra-70", "SKC Calama")])
     data = build_application_data(excel, gps, settings())
     assert len(data.equipment) == 1
     row = data.equipment.iloc[0]
@@ -105,17 +106,17 @@ def test_consolidation_across_sheets_and_latest_values() -> None:
     assert row["status"] == "En taller"
     assert row["workshop"] == "SKC Calama"
     assert row["gps_contract"] == "Centinela"
+    assert row["gps_place"] == "SKC Calama"
 
 
 def test_gps_is_deduplicated_before_contract_count() -> None:
-    excel = pd.DataFrame()
     gps = pd.DataFrame(
         [
-            {"nombre": "Quadra-70", "nombre_faena": "Centinela", "horas_ult": 100, "_gps_response_order": 0},
-            {"nombre": "Quadra 70", "nombre_faena": "Centinela", "horas_ult": 100, "_gps_response_order": 1},
+            gps_row("Quadra-70", "Faena", 0),
+            gps_row("Quadra 70", "Faena", 1),
         ]
     )
-    data = build_application_data(excel, gps, settings())
+    data = build_application_data(pd.DataFrame(), gps, settings())
     centinela = data.contracts[data.contracts["contract"] == "Centinela"].iloc[0]
     assert centinela["actual"] == 1
 
@@ -146,37 +147,18 @@ def test_certification_uses_most_recent_valid_date() -> None:
     assert pd.Timestamp(row["revision_tecnica"]) == pd.Timestamp("2028-01-01")
 
 
-def test_active_capacity_excludes_completed_status() -> None:
-    today = pd.Timestamp.now().normalize()
-    excel = pd.DataFrame(
+def test_current_capacity_uses_api_lugar_and_ignores_faena() -> None:
+    gps = pd.DataFrame(
         [
-            {
-                "Equipo": "E-1",
-                "Fecha Inicio": today - pd.Timedelta(days=2),
-                "Fecha Entrega": today + pd.Timedelta(days=2),
-                "Taller": "SKC Calama",
-                "Estado": "En proceso",
-                "_source_file": "Excel_1",
-                "_source_sheet": "Mov. equipos",
-                "_source_row": 2,
-                "_global_order": 0,
-            },
-            {
-                "Equipo": "E-2",
-                "Fecha Inicio": today - pd.Timedelta(days=2),
-                "Fecha Entrega": today + pd.Timedelta(days=2),
-                "Taller": "SKC Calama",
-                "Estado": "Finalizado",
-                "_source_file": "Excel_1",
-                "_source_sheet": "Mov. equipos",
-                "_source_row": 3,
-                "_global_order": 1,
-            },
+            gps_row("E-1", "Rio Loa", 0),
+            gps_row("E-2", "Rio Loa", 1),
+            gps_row("E-3", "Faena", 2),
         ]
     )
-    data = build_application_data(excel, pd.DataFrame(), settings())
-    calama = data.workshop_capacity[data.workshop_capacity["workshop"] == "SKC CALAMA"].iloc[0]
-    assert calama["occupied"] == 1
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    rio_loa = data.workshop_capacity[data.workshop_capacity["workshop"] == "RIO LOA"].iloc[0]
+    assert rio_loa["occupied"] == 2
+    assert set(data.current_workshops["equipment"]) == {"E-1", "E-2"}
 
 
 def test_search_by_plate() -> None:
@@ -230,32 +212,66 @@ def test_movements_only_use_mov_equipos_and_one_row_per_truck() -> None:
     assert movement["start_date"] == pd.Timestamp("2026-07-16")
     assert movement["end_date"] == pd.Timestamp("2026-07-20")
     assert movement["workshop_canonical"] == "SKC ANTOFAGASTA"
-    equipment = data.equipment.iloc[0]
-    assert equipment["start_date"] == pd.Timestamp("2026-07-16")
-    assert equipment["end_date"] == pd.Timestamp("2026-07-20")
 
 
-def test_weekly_projection_detects_over_capacity() -> None:
-    excel_rows = []
-    for index in range(3):
-        excel_rows.append(
+def test_weekly_projection_starts_with_api_inventory_and_adds_future_downs() -> None:
+    today = pd.Timestamp("2026-07-27")
+    excel = pd.DataFrame(
+        [
             {
-                "Equipo": f"E-{index + 1}",
-                "Fecha Inicio": "27/07/2026",
-                "Fecha Entrega": "02/08/2026",
+                "Equipo": "E-3",
+                "Fecha Inicio": "29/07/2026",
+                "Fecha Entrega": "31/07/2026",
                 "Taller": "Rio Loa",
                 "Faena": "Centinela",
                 "Estado": "En proceso",
                 "_source_file": "Excel_2",
                 "_source_sheet": "Mov. equipos",
-                "_source_row": index + 2,
-                "_global_order": index,
+                "_source_row": 2,
+                "_global_order": 0,
             }
-        )
-    data = build_application_data(pd.DataFrame(excel_rows), pd.DataFrame(), settings())
-    projection = build_weekly_workshop_projection(data.movements, pd.Timestamp("2026-07-27"))
+        ]
+    )
+    gps = pd.DataFrame(
+        [
+            gps_row("E-1", "Rio Loa", 0),
+            gps_row("E-2", "Rio Loa", 1),
+            gps_row("E-3", "Faena", 2),
+        ]
+    )
+    data = build_application_data(excel, gps, settings())
+    projection = build_weekly_workshop_projection(
+        data.movements,
+        data.current_workshops,
+        pd.Timestamp("2026-07-27"),
+        today=today,
+    )
     rio_loa = projection[projection["workshop"] == "RIO LOA"].iloc[0]
+    assert rio_loa["current"] == 2
+    assert rio_loa["downs"] == 1
+    assert rio_loa["ups"] == 1
     assert rio_loa["peak"] == 3
-    assert rio_loa["limit"] == 2
+    assert rio_loa["closing"] == 2
     assert rio_loa["status"] == "Sobrepasado"
     assert rio_loa["over_capacity"] == 1
+
+
+def test_external_workshops_are_grouped_and_keep_real_places() -> None:
+    gps = pd.DataFrame(
+        [
+            gps_row("E-1", "Indumar", 0),
+            gps_row("E-2", "SKC Santiago", 1),
+            gps_row("E-3", "Faena", 2),
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    external = data.current_workshops[
+        data.current_workshops["workshop_bucket"] == EXTERNAL_WORKSHOPS
+    ]
+    assert len(external) == 2
+    assert set(external["current_place"]) == {"Indumar", "SKC Santiago"}
+    capacity = data.workshop_capacity[
+        data.workshop_capacity["workshop"] == EXTERNAL_WORKSHOPS
+    ].iloc[0]
+    assert capacity["occupied"] == 2
+    assert pd.isna(capacity["limit"])

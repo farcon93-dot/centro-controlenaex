@@ -157,18 +157,23 @@ def suggest_workshop_capacity(
 
     capacity_payload = []
     for _, row in projection.iterrows():
+        limit = row.get("limit")
+        available = row.get("available_at_peak")
         capacity_payload.append(
             {
                 "taller": row.get("workshop"),
-                "capacidad_maxima": int(row.get("limit", 0)),
-                "equipos_inicio_semana": int(row.get("opening", 0)),
+                "capacidad_maxima": None if pd.isna(limit) else int(limit),
+                "equipos_actuales_segun_lugar_api": int(row.get("current", 0)),
+                "equipos_al_inicio_proyectado": int(row.get("opening", 0)),
                 "bajadas_semana": int(row.get("downs", 0)),
                 "subidas_semana": int(row.get("ups", 0)),
                 "maximo_proyectado": int(row.get("peak", 0)),
                 "cierre_semana": int(row.get("closing", 0)),
                 "sobre_capacidad": int(row.get("over_capacity", 0)),
-                "cupos_libres_en_peak": int(row.get("available_at_peak", 0)),
+                "cupos_libres_en_peak": None if pd.isna(available) else int(available),
+                "equipos_actuales": row.get("current_equipment", []),
                 "equipos_en_peak": row.get("peak_equipment", []),
+                "lugares_externos_detectados": row.get("external_locations", []),
             }
         )
 
@@ -199,6 +204,8 @@ Analiza exclusivamente las cifras calculadas por la aplicación para la semana
 Reglas obligatorias:
 - No inventes capacidades, fechas, talleres, distancias ni disponibilidad.
 - No propongas enviar equipos a un taller que tenga 0 cupos libres en el peak.
+- La ocupación actual proviene de la columna Lugar de la API y debe tratarse como fuente de verdad de hoy.
+- “TALLERES EXTERNOS” no tiene capacidad máxima configurada: menciónalo, pero no lo uses como destino sugerido.
 - Si un taller queda sobre capacidad, indica cuántos equipos conviene evaluar para reasignar.
 - Prioriza una solución práctica y breve, pero aclara que debe validarse compatibilidad técnica,
   distancia, repuestos y autorización operacional.
