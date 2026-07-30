@@ -63,18 +63,28 @@ def _record_for_ai(row: pd.Series) -> dict[str, Any]:
         "equipo": row.get("equipment"),
         "patente": row.get("plate"),
         "vin": row.get("vin"),
-        "ubicacion_gps": row.get("gps_faena"),
-        "estado_gps": row.get("gps_state"),
-        "horometro_gps": row.get("gps_hours"),
-        "estatus_planificacion": row.get("status"),
-        "taller_planificado": row.get("workshop"),
+        "marca": row.get("brand"),
+        "modelo": row.get("model"),
+        "sistema_control": row.get("control_system"),
+        "faena_actual": row.get("gps_faena"),
+        "lugar_actual": row.get("gps_place"),
+        "condicion_actual": row.get("gps_condition"),
+        "estado_actual": row.get("gps_state"),
+        "horas_km_desde_preventivo": row.get("gps_hours"),
+        "detalle_estado_equipos": row.get("status_detail"),
+        "estatus_movimiento": row.get("movement_status"),
+        "taller_planificado": row.get("planned_workshop"),
         "faena_planificada": row.get("planned_faena"),
         "bajada_taller": format_date(row.get("start_date")),
         "subida_faena": format_date(row.get("end_date")),
+        "trabajo_movimiento": row.get("movement_comments"),
         "revision_tecnica": format_date(row.get("revision_tecnica")),
+        "dias_rt": row.get("revision_tecnica_days"),
         "sernageomin": format_date(row.get("sernageomin")),
+        "dias_sernageomin": row.get("sernageomin_days"),
         "dgmn": format_date(row.get("dgmn")),
-        "comentarios": row.get("comments"),
+        "dias_dgmn": row.get("dgmn_days"),
+        "ultimos_trabajos": row.get("recent_works", []),
     }
 
 
@@ -94,8 +104,10 @@ def audit_equipment(
     prompt = f"""
 Actúa exclusivamente como auditor de consistencia de una flota minera.
 No inventes datos, no completes valores faltantes y no repitas toda la ficha.
-Compara la planificación Excel con la ubicación/estado GPS y revisa fechas/certificaciones.
-Entrega como máximo 2 líneas por equipo, usando uno de estos estados:
+Compara el estado actual del sistema de planificación con Mov. equipos y certificaciones.
+Si el estado es En proceso, usa obligatoriamente el detalle de Estado de equipos.
+Resume también el último trabajo relevante sin inventar ni mezclar otros camiones.
+Entrega como máximo 3 líneas por equipo, usando uno de estos estados:
 - OK: no se observa una incongruencia evidente.
 - REVISAR: explica brevemente la incongruencia o dato crítico.
 - SIN DATOS: no hay información suficiente.

@@ -103,7 +103,8 @@ def test_consolidation_across_sheets_and_latest_values() -> None:
     assert len(data.equipment) == 1
     row = data.equipment.iloc[0]
     assert row["plate"] == "ABCD12"
-    assert row["status"] == "En taller"
+    assert row["status"] == "OK"
+    assert row["planning_status"] == "En taller"
     assert row["workshop"] == "SKC Calama"
     assert row["gps_contract"] == "Centinela"
     assert row["gps_place"] == "SKC Calama"
@@ -275,3 +276,111 @@ def test_external_workshops_are_grouped_and_keep_real_places() -> None:
     ].iloc[0]
     assert capacity["occupied"] == 2
     assert pd.isna(capacity["limit"])
+
+
+
+def test_search_returns_requested_equipment_not_quadra_1029() -> None:
+    aliases = {
+        "EQ1": ["QUADRA-1029 AT Ex", "Quadra-1029"],
+        "EQ2": ["AUGER-168 AT", "Auger-168"],
+        "EQ3": ["QUADRA-1036 AT Ex", "Quadra-1036"],
+    }
+    assert search_equipment_ids("Auger-168", aliases) == ["EQ2"]
+    assert search_equipment_ids("Quadra-1036", aliases) == ["EQ3"]
+    assert search_equipment_ids("equipo inexistente", aliases) == []
+
+
+def test_api_fields_control_status_and_certification_days_are_read() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-1036 AT Ex",
+                "Faena": "Collahuasi",
+                "Condicion": "Catastrófico",
+                "Estado": "CATASTROFICO",
+                "Lugar": "SKC Alto Hospicio",
+                "Hrs/Kms desde ultimo preventivo": 113,
+                "Fecha Aprox. Proxima Mantencion": "04-02-2027",
+                "D. RT": 140,
+                "D. Sernageomin": 153,
+                "D. DGMN": 161,
+                "Marca": "ASTRA",
+                "Sistema Control": "E-BLAST",
+                "_gps_response_order": 0,
+            }
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["status"] == "CATASTROFICO"
+    assert row["condition"] == "Catastrófico"
+    assert row["control_system"] == "E-BLAST"
+    assert row["brand"] == "ASTRA"
+    assert row["revision_tecnica_days"] == 140
+    assert row["sernageomin_days"] == 153
+    assert row["dgmn_days"] == 161
+    today = pd.Timestamp.now().normalize()
+    assert pd.Timestamp(row["revision_tecnica"]) == today + pd.Timedelta(days=140)
+
+
+def test_tire_model_is_not_used_as_truck_model() -> None:
+    excel = pd.DataFrame(
+        [
+            {
+                "Equipo": "Quadra-70",
+                "Modelo": "Katana",
+                "_source_file": "Excel_1",
+                "_source_sheet": "Neumaticos",
+                "_source_row": 2,
+                "_global_order": 0,
+            }
+        ]
+    )
+    gps = pd.DataFrame([gps_row("Quadra-70", "Faena")])
+    data = build_application_data(excel, gps, settings())
+    assert data.equipment.iloc[0]["model"] == "N/A"
+
+
+def test_estado_de_equipos_and_recent_work_are_preserved() -> None:
+    excel = pd.DataFrame(
+        [
+            {
+                "Equipo": "Quadra-70",
+                "Estado de equipos": "Cambio de bomba finalizado; pendiente prueba operacional",
+                "Estado": "En proceso",
+                "Taller": "SKC Calama",
+                "Fecha actualización": "28/07/2026",
+                "_source_file": "Excel_2",
+                "_source_sheet": "En proceso",
+                "_source_row": 2,
+                "_global_order": 0,
+            },
+            {
+                "Equipo": "Quadra-70",
+                "Comentarios": "MP 900 y cambio de filtros",
+                "Estado": "Listo",
+                "Taller": "Rio Loa",
+                "Fecha Entrega": "15/07/2026",
+                "_source_file": "Excel_2",
+                "_source_sheet": "Mov. equipos",
+                "_source_row": 3,
+                "_global_order": 1,
+            },
+        ]
+    )
+    gps = pd.DataFrame(
+        [
+            {
+                **gps_row("Quadra-70", "SKC Calama"),
+                "Estado": "En proceso",
+                "Condicion": "Correctivo",
+            }
+        ]
+    )
+    data = build_application_data(excel, gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["status"] == "En proceso"
+    assert "Cambio de bomba" in row["status_detail"]
+    details = " ".join(item["detalle"] for item in row["recent_works"])
+    assert "Cambio de bomba" in details
+    assert "MP 900" in details

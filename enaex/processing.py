@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
+import re
 from typing import Any, Iterable
 
 import pandas as pd
@@ -70,6 +71,134 @@ def canonical_contract(value: Any) -> str:
     return clean_display(value, default="Sin faena")
 
 
+
+
+def parse_days_remaining(value: Any) -> int | None:
+    """Extrae días restantes desde valores como 140, -5 o "🟢 31"."""
+    if is_empty(value):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        number = int(float(value))
+        return number if -5000 <= number <= 5000 else None
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
+    if not match:
+        return None
+    number = int(float(match.group(0).replace(",", ".")))
+    return number if -5000 <= number <= 5000 else None
+
+
+def expiration_from_api(date_value: Any, days_value: Any, today: pd.Timestamp | None = None) -> tuple[pd.Timestamp | None, int | None, str]:
+    """Prioriza fecha explícita; si la API entrega días, calcula su fecha de vencimiento."""
+    today = (today or pd.Timestamp.now()).normalize()
+    explicit = parse_date(date_value)
+    days = parse_days_remaining(days_value)
+    if explicit is not None:
+        return explicit, int((explicit - today).days), "api_date"
+    if days is not None:
+        return today + pd.Timedelta(days=days), days, "api_days"
+    return None, None, "missing"
+
+
+def _valid_entity_key(key: str, minimum_length: int = 4) -> bool:
+    """Evita unir equipos mediante textos genéricos sin números."""
+    return bool(key) and len(key) >= minimum_length and any(character.isdigit() for character in key)
+
+
+def _sheet_name(value: Any) -> str:
+    return normalize_text(value)
+
+
+def _latest_nonempty_preferred(
+    group: pd.DataFrame,
+    field: str,
+    preferred_sheet_tokens: tuple[str, ...] = (),
+    rejected_sheet_tokens: tuple[str, ...] = (),
+) -> Any:
+    candidates = group
+    if "_source_sheet" in group.columns:
+        sheet_norm = group["_source_sheet"].map(_sheet_name)
+        if rejected_sheet_tokens:
+            rejected = sheet_norm.map(lambda text: any(token in text for token in rejected_sheet_tokens))
+            candidates = group.loc[~rejected]
+            if candidates.empty:
+                return pd.NA
+        if preferred_sheet_tokens:
+            preferred = candidates["_source_sheet"].map(_sheet_name).map(
+                lambda text: any(token in text for token in preferred_sheet_tokens)
+            )
+            preferred_rows = candidates.loc[preferred]
+            if not preferred_rows.empty:
+                candidates = preferred_rows
+    return _latest_nonempty(candidates, field)
+
+
+def _identifier_alias_variants(value: Any) -> set[str]:
+    display = clean_display(value, default="")
+    if not display:
+        return set()
+    variants = {display}
+    normalized = normalize_text(display)
+    # Los nombres de la API suelen venir como "QUADRA-1029 AT Ex". Se agrega
+    # una variante limpia para que "Quadra-1029" sea una coincidencia exacta.
+    match = re.search(r"\b(quadra|auger|camion|camión|unidad|equipo)[\s_-]*([a-z0-9-]+)", normalized)
+    if match:
+        prefix = match.group(1)
+        code = match.group(2)
+        variants.add(f"{prefix}-{code}")
+        variants.add(f"{prefix} {code}")
+    return variants
+
+
+def _build_recent_work_history(group: pd.DataFrame, limit: int = 6) -> list[dict[str, Any]]:
+    """Recupera últimos trabajos/estados sin inventar ni mezclar otros equipos."""
+    if group.empty:
+        return []
+    ordered = group.sort_values(
+        ["_has_update", "_update_parsed", "_global_order"],
+        ascending=False,
+        na_position="last",
+    )
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _, row in ordered.iterrows():
+        detail = clean_display(row.get("equipment_status_detail"), default="")
+        comments = clean_display(row.get("comments"), default="")
+        status = clean_display(row.get("status"), default="")
+        workshop = clean_display(row.get("workshop"), default="")
+        if not detail and not comments:
+            continue
+        event_date = (
+            parse_date(row.get("update_date"))
+            or parse_date(row.get("end_date"))
+            or parse_date(row.get("start_date"))
+        )
+        source_sheet = clean_display(row.get("_source_sheet"), default="")
+        text = detail or comments
+        key = (format_date(event_date), normalize_text(text), normalize_text(workshop))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(
+            {
+                "fecha": format_date(event_date),
+                "estado": status or "N/A",
+                "taller": workshop or "N/A",
+                "detalle": text,
+                "hoja": source_sheet or "N/A",
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _coalesce(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
     result = pd.Series(pd.NA, index=frame.index, dtype="object")
     for column in columns:
@@ -100,11 +229,11 @@ def canonicalize_excel(excel_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,
     if "_global_order" not in history.columns:
         history["_global_order"] = range(len(history))
 
-    # Soporta libros con celdas combinadas: el nombre del equipo suele estar solo en la primera fila.
+    # Soporta celdas combinadas sin propagar patente/VIN a equipos distintos.
+    # Solo el nombre del equipo puede heredarse y con un límite corto.
     grouping = [column for column in ("_source_file", "_source_sheet") if column in history.columns]
     if grouping:
-        for field in ("equipment", "plate", "vin"):
-            history[field] = history.groupby(grouping, dropna=False)[field].ffill(limit=50)
+        history["equipment"] = history.groupby(grouping, dropna=False)["equipment"].ffill(limit=12)
 
     history["equipment_key"] = history["equipment"].map(normalize_identifier)
     history["plate_key"] = history["plate"].map(normalize_identifier)
@@ -160,7 +289,12 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
 
     gps["timestamp_parsed"] = gps["timestamp"].map(parse_date)
     gps["_has_timestamp"] = gps["timestamp_parsed"].notna().astype(int)
-    completeness_fields = ["equipment", "plate", "vin", "faena", "place", "brand", "model", "hours", "status"]
+    completeness_fields = [
+        "equipment", "plate", "vin", "faena", "place", "condition", "brand", "model",
+        "control_system", "hours", "status", "return_operation_date", "days_out_service",
+        "next_maintenance_date", "revision_tecnica_date", "sernageomin_date", "dgmn_date",
+        "revision_tecnica_days", "sernageomin_days", "dgmn_days",
+    ]
     gps["_completeness"] = gps[completeness_fields].apply(
         lambda row: sum(not is_empty(value) for value in row), axis=1
     )
@@ -191,9 +325,9 @@ def assign_entities(history: pd.DataFrame) -> pd.DataFrame:
     seen: dict[str, int] = {}
     for position, row in enumerate(history[["equipment_key", "plate_key", "vin_key"]].itertuples(index=False)):
         keys = [
-            f"equipment:{row.equipment_key}" if row.equipment_key else "",
-            f"plate:{row.plate_key}" if row.plate_key else "",
-            f"vin:{row.vin_key}" if row.vin_key else "",
+            f"equipment:{row.equipment_key}" if _valid_entity_key(row.equipment_key) else "",
+            f"plate:{row.plate_key}" if _valid_entity_key(row.plate_key, minimum_length=5) else "",
+            f"vin:{row.vin_key}" if _valid_entity_key(row.vin_key, minimum_length=6) else "",
         ]
         for key in (key for key in keys if key):
             if key in seen:
@@ -249,9 +383,28 @@ def _gps_candidates_for_group(group: pd.DataFrame, gps: pd.DataFrame) -> pd.Data
 
 
 def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Consolida cada camión sin mezclar identidades ni confundir datos técnicos."""
     records: list[dict[str, Any]] = []
     aliases_by_entity: dict[str, list[str]] = {}
     gps_used: set[str] = set()
+    today = pd.Timestamp.now().normalize()
+
+    def certificate_values(
+        group: pd.DataFrame,
+        gps_row: pd.Series | None,
+        excel_field: str,
+        api_date_field: str,
+        api_days_field: str,
+    ) -> tuple[pd.Timestamp | None, str, int | None, str]:
+        api_date = gps_row.get(api_date_field) if gps_row is not None else None
+        api_days = gps_row.get(api_days_field) if gps_row is not None else None
+        expiration, days, source = expiration_from_api(api_date, api_days, today=today)
+        if expiration is not None:
+            return expiration, "ok", days, source
+        excel_date, excel_quality = _cert_summary(group, excel_field)
+        if excel_date is not None:
+            return excel_date, excel_quality, int((excel_date - today).days), "excel"
+        return None, excel_quality, None, "missing"
 
     for entity_id, group in history.groupby("entity_id", sort=False):
         gps_candidates = _gps_candidates_for_group(group, gps)
@@ -266,30 +419,69 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
             gps_used.add(str(gps_row["gps_identity_key"]))
 
         latest = {field: _latest_nonempty(group, field) for field in CANONICAL_FIELDS}
-        rt_date, rt_quality = _cert_summary(group, "revision_tecnica")
-        sngm_date, sngm_quality = _cert_summary(group, "sernageomin")
-        dgmn_date, dgmn_quality = _cert_summary(group, "dgmn")
+        gps_status = clean_display(gps_row.get("status"), default="") if gps_row is not None else ""
+        gps_condition = clean_display(gps_row.get("condition"), default="") if gps_row is not None else ""
 
-        name = clean_display(latest["equipment"], default="")
+        # Los datos técnicos no se toman desde hojas de movimientos, neumáticos o repuestos.
+        technical_preferred = ("maestro", "ficha", "flota", "base", "datos", "inventario")
+        technical_rejected = (
+            "mov equipos", "movimiento", "en proceso", "neumatic", "repuesto", "bodega",
+            "componente", "mantencion semanal", "planificacion semanal",
+        )
+        excel_brand = _latest_nonempty_preferred(
+            group, "brand", technical_preferred, technical_rejected
+        )
+        excel_model = _latest_nonempty_preferred(
+            group, "model", technical_preferred, technical_rejected
+        )
+        excel_control = _latest_nonempty_preferred(
+            group, "control_system", technical_preferred, technical_rejected
+        )
+
+        status_detail = _latest_nonempty_preferred(
+            group,
+            "equipment_status_detail",
+            preferred_sheet_tokens=("en proceso",) if "en proceso" in normalize_text(gps_status) else (),
+        )
+        recent_works = _build_recent_work_history(group)
+
+        rt_date, rt_quality, rt_days, rt_source = certificate_values(
+            group, gps_row, "revision_tecnica", "revision_tecnica_date", "revision_tecnica_days"
+        )
+        sngm_date, sngm_quality, sngm_days, sngm_source = certificate_values(
+            group, gps_row, "sernageomin", "sernageomin_date", "sernageomin_days"
+        )
+        dgmn_date, dgmn_quality, dgmn_days, dgmn_source = certificate_values(
+            group, gps_row, "dgmn", "dgmn_date", "dgmn_days"
+        )
+
+        excel_name = clean_display(latest["equipment"], default="")
+        gps_name = clean_display(gps_row.get("equipment"), default="") if gps_row is not None else ""
+        name = gps_name or excel_name
         plate = clean_display(latest["plate"], default="")
         vin = clean_display(latest["vin"], default="")
+        if gps_row is not None:
+            plate = plate or clean_display(gps_row.get("plate"), default="")
+            vin = vin or clean_display(gps_row.get("vin"), default="")
         if not name:
             name = plate or vin or entity_id
 
-        display_aliases = {
-            clean_display(value, default="")
-            for field in ("equipment", "plate", "vin")
-            for value in group[field].tolist()
-            if not is_empty(value)
-        }
+        display_aliases: set[str] = set()
+        for field in ("equipment", "plate", "vin"):
+            for value in group[field].tolist():
+                if not is_empty(value):
+                    display_aliases.update(_identifier_alias_variants(value))
         if gps_row is not None:
-            display_aliases.update(
-                clean_display(gps_row.get(field), default="")
-                for field in ("equipment", "plate", "vin")
-                if not is_empty(gps_row.get(field))
-            )
+            for field in ("equipment", "plate", "vin"):
+                if not is_empty(gps_row.get(field)):
+                    display_aliases.update(_identifier_alias_variants(gps_row.get(field)))
         display_aliases.discard("")
         aliases_by_entity[entity_id] = sorted(display_aliases)
+
+        api_brand = clean_display(gps_row.get("brand"), default="") if gps_row is not None else ""
+        api_model = clean_display(gps_row.get("model"), default="") if gps_row is not None else ""
+        api_control = clean_display(gps_row.get("control_system"), default="") if gps_row is not None else ""
+        excel_status = clean_display(latest["status"], default="")
 
         records.append(
             {
@@ -297,32 +489,51 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "equipment": name,
                 "plate": plate or "N/A",
                 "vin": vin or "N/A",
-                "brand": clean_display(latest["brand"]),
-                "model": clean_display(latest["model"]),
+                "brand": api_brand or clean_display(excel_brand),
+                "model": api_model or clean_display(excel_model),
                 "year": clean_display(latest["year"]),
                 "capacity": clean_display(latest["capacity"]),
-                "control_system": clean_display(latest["control_system"]),
+                "control_system": api_control or clean_display(excel_control),
                 "excel_hours": clean_display(latest["hours"]),
-                "status": clean_display(latest["status"]),
+                # Estado actual exacto del sistema de planificación/API.
+                "status": gps_status or excel_status or "N/A",
+                "condition": gps_condition or "N/A",
+                "planning_status": excel_status or "N/A",
+                "status_detail": clean_display(status_detail),
                 "workshop": clean_display(latest["workshop"]),
                 "comments": clean_display(latest["comments"]),
+                "recent_works": recent_works,
                 "start_date": parse_date(latest["start_date"]),
                 "end_date": parse_date(latest["end_date"]),
                 "planned_faena": clean_display(latest["faena"]),
                 "last_excel_update": parse_date(latest["update_date"]),
+                "movement_status": "N/A",
+                "movement_comments": "N/A",
+                "planned_workshop": "N/A",
                 "revision_tecnica": rt_date,
                 "revision_tecnica_quality": rt_quality,
+                "revision_tecnica_days": rt_days,
+                "revision_tecnica_source": rt_source,
                 "sernageomin": sngm_date,
                 "sernageomin_quality": sngm_quality,
+                "sernageomin_days": sngm_days,
+                "sernageomin_source": sngm_source,
                 "dgmn": dgmn_date,
                 "dgmn_quality": dgmn_quality,
+                "dgmn_days": dgmn_days,
+                "dgmn_source": dgmn_source,
                 "gps_faena": clean_display(gps_row.get("faena")) if gps_row is not None else "No reporta GPS",
                 "gps_place": clean_display(gps_row.get("place")) if gps_row is not None else "N/A",
                 "gps_contract": str(gps_row.get("canonical_contract")) if gps_row is not None else "Sin faena",
-                "gps_state": clean_display(gps_row.get("status")) if gps_row is not None else "N/A",
+                "gps_state": gps_status or "N/A",
+                "gps_condition": gps_condition or "N/A",
                 "gps_hours": clean_display(gps_row.get("hours")) if gps_row is not None else "N/A",
-                "gps_brand": clean_display(gps_row.get("brand")) if gps_row is not None else "N/A",
-                "gps_model": clean_display(gps_row.get("model")) if gps_row is not None else "N/A",
+                "gps_brand": api_brand or "N/A",
+                "gps_model": api_model or "N/A",
+                "gps_control_system": api_control or "N/A",
+                "return_operation_date": parse_date(gps_row.get("return_operation_date")) if gps_row is not None else pd.NaT,
+                "days_out_service": parse_days_remaining(gps_row.get("days_out_service")) if gps_row is not None else None,
+                "next_maintenance_date": parse_date(gps_row.get("next_maintenance_date")) if gps_row is not None else pd.NaT,
                 "gps_last_update": gps_row.get("timestamp_parsed") if gps_row is not None else pd.NaT,
                 "history_rows": len(group),
                 "sources": ", ".join(
@@ -336,7 +547,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
             }
         )
 
-    # Equipos que están en GPS pero todavía no existen en los Excel.
+    # Equipos presentes en API pero aún no identificados en Excel.
     for _, gps_row in gps.iterrows():
         identity = str(gps_row["gps_identity_key"])
         if identity in gps_used:
@@ -346,8 +557,21 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
         plate = clean_display(gps_row.get("plate"), default="")
         vin = clean_display(gps_row.get("vin"), default="")
         name = name or plate or vin or entity_id
-        aliases = [alias for alias in (name, plate, vin) if alias]
-        aliases_by_entity[entity_id] = sorted(set(aliases))
+        aliases: set[str] = set()
+        for value in (name, plate, vin):
+            aliases.update(_identifier_alias_variants(value))
+        aliases_by_entity[entity_id] = sorted(alias for alias in aliases if alias)
+
+        rt_date, rt_days, rt_source = expiration_from_api(
+            gps_row.get("revision_tecnica_date"), gps_row.get("revision_tecnica_days"), today=today
+        )
+        sngm_date, sngm_days, sngm_source = expiration_from_api(
+            gps_row.get("sernageomin_date"), gps_row.get("sernageomin_days"), today=today
+        )
+        dgmn_date, dgmn_days, dgmn_source = expiration_from_api(
+            gps_row.get("dgmn_date"), gps_row.get("dgmn_days"), today=today
+        )
+
         records.append(
             {
                 "entity_id": entity_id,
@@ -358,39 +582,58 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "model": clean_display(gps_row.get("model")),
                 "year": "N/A",
                 "capacity": "N/A",
-                "control_system": "N/A",
+                "control_system": clean_display(gps_row.get("control_system")),
                 "excel_hours": "N/A",
-                "status": "N/A",
+                "status": clean_display(gps_row.get("status")),
+                "condition": clean_display(gps_row.get("condition")),
+                "planning_status": "N/A",
+                "status_detail": "N/A",
                 "workshop": "N/A",
                 "comments": "N/A",
+                "recent_works": [],
                 "start_date": pd.NaT,
                 "end_date": pd.NaT,
                 "planned_faena": "N/A",
                 "last_excel_update": pd.NaT,
-                "revision_tecnica": pd.NaT,
-                "revision_tecnica_quality": "missing",
-                "sernageomin": pd.NaT,
-                "sernageomin_quality": "missing",
-                "dgmn": pd.NaT,
-                "dgmn_quality": "missing",
+                "movement_status": "N/A",
+                "movement_comments": "N/A",
+                "planned_workshop": "N/A",
+                "revision_tecnica": rt_date,
+                "revision_tecnica_quality": "ok" if rt_date is not None else "missing",
+                "revision_tecnica_days": rt_days,
+                "revision_tecnica_source": rt_source,
+                "sernageomin": sngm_date,
+                "sernageomin_quality": "ok" if sngm_date is not None else "missing",
+                "sernageomin_days": sngm_days,
+                "sernageomin_source": sngm_source,
+                "dgmn": dgmn_date,
+                "dgmn_quality": "ok" if dgmn_date is not None else "missing",
+                "dgmn_days": dgmn_days,
+                "dgmn_source": dgmn_source,
                 "gps_faena": clean_display(gps_row.get("faena")),
                 "gps_place": clean_display(gps_row.get("place")),
                 "gps_contract": str(gps_row.get("canonical_contract")),
                 "gps_state": clean_display(gps_row.get("status")),
+                "gps_condition": clean_display(gps_row.get("condition")),
                 "gps_hours": clean_display(gps_row.get("hours")),
                 "gps_brand": clean_display(gps_row.get("brand")),
                 "gps_model": clean_display(gps_row.get("model")),
+                "gps_control_system": clean_display(gps_row.get("control_system")),
+                "return_operation_date": parse_date(gps_row.get("return_operation_date")),
+                "days_out_service": parse_days_remaining(gps_row.get("days_out_service")),
+                "next_maintenance_date": parse_date(gps_row.get("next_maintenance_date")),
                 "gps_last_update": gps_row.get("timestamp_parsed"),
                 "history_rows": 0,
-                "sources": "Solo GPS",
+                "sources": "Solo API",
             }
         )
 
     equipment = pd.DataFrame(records)
     if not equipment.empty:
-        equipment = equipment.sort_values("equipment", key=lambda series: series.astype(str).str.lower()).reset_index(drop=True)
+        equipment = equipment.sort_values(
+            "equipment", key=lambda series: series.astype(str).str.lower()
+        ).reset_index(drop=True)
     return equipment, aliases_by_entity
-
 
 def build_certifications(equipment: pd.DataFrame, today: pd.Timestamp | None = None) -> pd.DataFrame:
     if equipment.empty:
@@ -583,7 +826,7 @@ def apply_movement_plan_to_equipment(
     equipment: pd.DataFrame,
     movements: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Hace que las fechas válidas de la ficha sean solo las de Mov. equipos."""
+    """Agrega el plan semanal sin reemplazar el estado actual de la API."""
     if equipment.empty:
         return equipment
 
@@ -591,6 +834,9 @@ def apply_movement_plan_to_equipment(
     result["start_date"] = pd.NaT
     result["end_date"] = pd.NaT
     result["movement_source"] = "Sin planificación en Mov. equipos"
+    result["movement_status"] = "N/A"
+    result["movement_comments"] = "N/A"
+    result["planned_workshop"] = "N/A"
 
     if movements.empty:
         return result
@@ -606,17 +852,12 @@ def apply_movement_plan_to_equipment(
         result.at[index, "start_date"] = movement.get("start_date")
         result.at[index, "end_date"] = movement.get("end_date")
         result.at[index, "movement_source"] = movement.get("source", "Mov. equipos")
-
-        # Para que la ficha y la auditoría IA usen el mismo plan semanal.
-        for target, source in (
-            ("workshop", "workshop"),
-            ("planned_faena", "faena"),
-            ("status", "status"),
-            ("comments", "comments"),
-        ):
-            value = movement.get(source)
-            if not is_empty(value):
-                result.at[index, target] = value
+        result.at[index, "movement_status"] = clean_display(movement.get("status"))
+        result.at[index, "movement_comments"] = clean_display(movement.get("comments"))
+        result.at[index, "planned_workshop"] = clean_display(movement.get("workshop"))
+        faena = movement.get("faena")
+        if not is_empty(faena):
+            result.at[index, "planned_faena"] = faena
     return result
 
 
@@ -992,39 +1233,51 @@ def build_contracts(gps: pd.DataFrame) -> pd.DataFrame:
 def search_equipment_ids(
     term: str,
     aliases_by_entity: dict[str, list[str]],
-    max_results: int = 8,
+    max_results: int = 1,
 ) -> list[str]:
+    """Busca un equipo de forma conservadora para evitar fichas incorrectas."""
     normalized_term = normalize_identifier(term)
     if not normalized_term:
         return []
 
-    scored: list[tuple[str, float]] = []
+    normalized_by_entity: dict[str, set[str]] = {}
     for entity_id, aliases in aliases_by_entity.items():
-        normalized_aliases = [normalize_identifier(alias) for alias in aliases if normalize_identifier(alias)]
-        if not normalized_aliases:
-            continue
-        if normalized_term in normalized_aliases:
-            score = 100.0
-        elif len(normalized_term) >= 4 and any(normalized_term in alias for alias in normalized_aliases):
-            score = 94.0
-        elif any(len(alias) >= 4 and alias in normalized_term for alias in normalized_aliases):
-            score = 88.0
-        else:
-            score = max(float(WRatio(normalized_term, alias)) for alias in normalized_aliases)
-        if score >= 72.0:
-            scored.append((entity_id, score))
+        normalized_by_entity[entity_id] = {
+            normalize_identifier(alias) for alias in aliases if normalize_identifier(alias)
+        }
 
+    exact = [entity_id for entity_id, aliases in normalized_by_entity.items() if normalized_term in aliases]
+    if len(exact) == 1:
+        return exact
+    if len(exact) > 1:
+        return exact[:max_results]
+
+    # Coincidencia parcial solo cuando identifica un único camión.
+    contains = [
+        entity_id
+        for entity_id, aliases in normalized_by_entity.items()
+        if len(normalized_term) >= 5 and any(normalized_term in alias for alias in aliases)
+    ]
+    if len(contains) == 1:
+        return contains
+
+    scored: list[tuple[str, float]] = []
+    for entity_id, aliases in normalized_by_entity.items():
+        if not aliases:
+            continue
+        score = max(float(WRatio(normalized_term, alias)) for alias in aliases)
+        if score >= 88.0:
+            scored.append((entity_id, score))
     scored.sort(key=lambda item: (-item[1], item[0]))
     if not scored:
         return []
-    top_score = scored[0][1]
-    if top_score >= 99.9:
-        selected = [item for item in scored if item[1] >= 99.9]
-    elif top_score >= 93.0:
-        selected = [item for item in scored if item[1] >= top_score - 0.5]
-    else:
-        selected = scored[:3]
-    return [entity_id for entity_id, _ in selected[:max_results]]
+
+    # No entrega un resultado difuso si hay otra alternativa casi igual.
+    best_id, best_score = scored[0]
+    second_score = scored[1][1] if len(scored) > 1 else 0.0
+    if best_score < 92.0 or best_score - second_score < 6.0:
+        return []
+    return [best_id]
 
 
 def build_application_data(

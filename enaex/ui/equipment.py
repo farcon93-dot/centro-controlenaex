@@ -12,6 +12,7 @@ from enaex.ui.common import render_equipment_card
 SEARCH_STATE_KEY = "enaex_search_entity_ids"
 SEARCH_NOT_FOUND_KEY = "enaex_search_not_found"
 AI_RESULT_KEY = "enaex_ai_result"
+SEARCH_QUERY_KEY = "enaex_search_query"
 
 
 def render_equipment_page(
@@ -29,6 +30,9 @@ def render_equipment_page(
     if submitted:
         terms = [term.strip() for term in query.split(",") if term.strip()]
         selected_ids: list[str] = []
+        st.session_state[SEARCH_STATE_KEY] = []
+        st.session_state[SEARCH_NOT_FOUND_KEY] = []
+        st.session_state[SEARCH_QUERY_KEY] = query.strip()
         not_found: list[str] = []
         for term in terms:
             matches = search_equipment_ids(term, data.search_aliases)
@@ -52,6 +56,10 @@ def render_equipment_page(
         st.info("Escribe uno o más equipos y pulsa “Consultar fichas técnicas”.")
         return
 
+    searched_query = st.session_state.get(SEARCH_QUERY_KEY, "")
+    if searched_query:
+        st.caption(f"Resultado para: {searched_query}")
+
     selected = data.equipment[data.equipment["entity_id"].isin(selected_ids)].copy()
     selected["_order"] = selected["entity_id"].map({entity_id: index for index, entity_id in enumerate(selected_ids)})
     selected = selected.sort_values("_order").drop(columns="_order")
@@ -65,7 +73,7 @@ def render_equipment_page(
         st.info("Agrega GEMINI_API_KEY en .streamlit/secrets.toml para activar esta función.")
     elif not ai_model:
         st.warning("No se encontró un modelo Gemini compatible con tu clave.")
-    elif st.button("Auditar todos los equipos mostrados con IA"):
+    elif st.button("Auditar estado e historial de los equipos con IA"):
         with st.spinner("Gemini está comparando planificación, GPS y certificaciones..."):
             result, error = audit_equipment(settings.gemini_api_key, ai_model, selected)
         st.session_state[AI_RESULT_KEY] = {"result": result, "error": error}

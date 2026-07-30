@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from enaex.models import ApplicationData
-from enaex.normalize import format_date
+from enaex.normalize import format_date, normalize_text
 
 
 CSS = """
@@ -127,42 +127,80 @@ def render_contract_card(contract: str, actual: int, target: int, status: str) -
     )
 
 
+def _certificate_label(row: pd.Series, date_field: str, days_field: str) -> str:
+    date_text = format_date(row.get(date_field))
+    days = row.get(days_field)
+    if days is None or pd.isna(days):
+        return date_text
+    try:
+        return f"{date_text} ({int(days)} días)"
+    except (TypeError, ValueError):
+        return date_text
+
+
 def render_equipment_card(row: pd.Series) -> None:
     with st.container(border=True):
         st.subheader(f"🚛 Ficha Técnica: {row.get('equipment', 'Equipo')}")
-        gps_col, plan_col = st.columns(2)
-        with gps_col:
-            st.markdown("#### 📡 Identificación y GPS")
+        current_col, plan_col = st.columns(2)
+
+        with current_col:
+            st.markdown("#### 📡 Sistema de planificación — estado actual")
             st.info(
-                f"📍 **Faena GPS:** {row.get('gps_faena', 'N/A')}  |  "
-                f"🏭 **Lugar actual:** {row.get('gps_place', 'N/A')}  |  "
-                f"⚙️ **Estado:** {row.get('gps_state', 'N/A')}"
+                f"📍 **Faena:** {row.get('gps_faena', 'N/A')}  |  "
+                f"🏭 **Lugar:** {row.get('gps_place', 'N/A')}  |  "
+                f"🧭 **Condición:** {row.get('gps_condition', row.get('condition', 'N/A'))}  |  "
+                f"⚙️ **Estado:** {row.get('gps_state', row.get('status', 'N/A'))}"
             )
             c1, c2 = st.columns(2)
             c1.markdown(f"**Patente:** {row.get('plate', 'N/A')}")
             c1.markdown(f"**VIN/Chasis:** {row.get('vin', 'N/A')}")
             c1.markdown(f"**Marca:** {row.get('brand', 'N/A')}")
             c1.markdown(f"**Modelo:** {row.get('model', 'N/A')}")
-            c2.markdown(f"**Año:** {row.get('year', 'N/A')}")
-            c2.markdown(f"**Capacidad:** {row.get('capacity', 'N/A')}")
             c2.markdown(f"**Sistema de control:** {row.get('control_system', 'N/A')}")
-            c2.markdown(f"**Horómetro GPS:** {row.get('gps_hours', 'N/A')}")
+            c2.markdown(f"**Hrs/Kms desde último preventivo:** {row.get('gps_hours', 'N/A')}")
+            c2.markdown(f"**Próxima mantención:** {format_date(row.get('next_maintenance_date'))}")
+            c2.markdown(f"**Retorno a operación:** {format_date(row.get('return_operation_date'))}")
 
-            st.markdown("**🗓️ Certificaciones**")
+            st.markdown("**🗓️ Certificaciones del sistema de planificación**")
             st.caption(
-                f"Revisión Técnica: {format_date(row.get('revision_tecnica'))} | "
-                f"Sernageomin: {format_date(row.get('sernageomin'))} | "
-                f"DGMN: {format_date(row.get('dgmn'))}"
+                f"RT: {_certificate_label(row, 'revision_tecnica', 'revision_tecnica_days')} | "
+                f"Sernageomin: {_certificate_label(row, 'sernageomin', 'sernageomin_days')} | "
+                f"DGMN: {_certificate_label(row, 'dgmn', 'dgmn_days')}"
             )
 
         with plan_col:
-            st.markdown("#### 🗓️ Planificación semanal — Mov. equipos")
+            st.markdown("#### 🗓️ Planificación semanal")
             st.success(
-                f"📋 **Estatus:** {row.get('status', 'N/A')}  |  "
-                f"🔧 **Taller:** {row.get('workshop', 'N/A')}"
+                f"📋 **Estado actual:** {row.get('status', 'N/A')}  |  "
+                f"🔧 **Taller planificado:** {row.get('planned_workshop', 'N/A')}"
             )
+
+            status_detail = str(row.get("status_detail", "N/A"))
+            if "en proceso" in normalize_text(row.get("status")):
+                st.warning(f"**Detalle del estado En proceso:** {status_detail}")
+            else:
+                st.markdown(f"**Detalle de Estado de equipos:** {status_detail}")
+
             st.markdown(f"**Faena planificada:** {row.get('planned_faena', 'N/A')}")
             st.markdown(f"**Bajada a taller:** {format_date(row.get('start_date'))}")
             st.markdown(f"**Subida/entrega a faena:** {format_date(row.get('end_date'))}")
-            st.markdown(f"**Comentario o trabajo:** {row.get('comments', 'N/A')}")
-            st.caption(f"Fuente de fechas de movimiento: {row.get('movement_source', 'Sin planificación en Mov. equipos')}")
+            st.markdown(f"**Estatus en Mov. equipos:** {row.get('movement_status', 'N/A')}")
+            st.markdown(f"**Trabajo/comentario de Mov. equipos:** {row.get('movement_comments', 'N/A')}")
+            st.caption(
+                f"Fuente de fechas: {row.get('movement_source', 'Sin planificación en Mov. equipos')}"
+            )
+
+        recent = row.get("recent_works", [])
+        with st.expander("🧰 Últimos trabajos, estados y bajadas registradas"):
+            if isinstance(recent, list) and recent:
+                history = pd.DataFrame(recent)
+                preferred = ["fecha", "estado", "taller", "detalle", "hoja"]
+                columns = [column for column in preferred if column in history.columns]
+                st.dataframe(
+                    history[columns],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.info("No se detectaron comentarios históricos asociados a este equipo.")
+
