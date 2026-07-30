@@ -439,53 +439,201 @@ def build_certifications(equipment: pd.DataFrame, today: pd.Timestamp | None = N
     return pd.DataFrame(rows).sort_values(["priority", "days", "equipment"], na_position="last").reset_index(drop=True)
 
 
+def _is_movement_sheet(value: Any) -> bool:
+    """Acepta únicamente la hoja semanal destinada a movimientos de equipos."""
+    normalized = normalize_text(value)
+    valid_names = {
+        "mov equipos",
+        "movimiento equipos",
+        "movimientos equipos",
+        "movimientos de equipos",
+    }
+    return normalized in valid_names or normalized.startswith("mov equipos ")
+
+
+def _latest_movement_value(group: pd.DataFrame, field: str) -> Any:
+    """Último valor no vacío dentro de la hoja Mov. equipos."""
+    ordered = group.sort_values(
+        ["_has_update", "_update_parsed", "_global_order"],
+        ascending=True,
+        na_position="first",
+    )
+    for value in reversed(ordered[field].tolist()):
+        if not is_empty(value):
+            return value
+    return pd.NA
+
+
 def build_movements(history: pd.DataFrame, equipment: pd.DataFrame) -> pd.DataFrame:
-    if history.empty:
+    """
+    Construye una sola planificación vigente por camión.
+
+    Reglas:
+    - Solo usa la pestaña ``Mov. equipos`` del Excel de planificación semanal.
+    - Ignora fechas detectadas en hojas como ``En proceso`` u otras hojas.
+    - Devuelve una única fecha de bajada y una única fecha de subida por equipo.
+    """
+    if history.empty or "_source_sheet" not in history.columns:
         return pd.DataFrame()
+
+    movement_history = history[history["_source_sheet"].map(_is_movement_sheet)].copy()
+    if movement_history.empty:
+        return pd.DataFrame()
+
+    movement_history["_movement_start"] = movement_history["start_date"].map(parse_date)
+    movement_history["_movement_end"] = movement_history["end_date"].map(parse_date)
+    movement_history = movement_history[
+        movement_history["_movement_start"].notna() | movement_history["_movement_end"].notna()
+    ].copy()
+    if movement_history.empty:
+        return pd.DataFrame()
+
     fallback = equipment.set_index("entity_id").to_dict("index") if not equipment.empty else {}
     rows: list[dict[str, Any]] = []
 
-    for _, row in history.iterrows():
-        start = parse_date(row.get("start_date"))
-        end = parse_date(row.get("end_date"))
-        if start is None and end is None:
-            continue
-        entity_id = str(row["entity_id"])
-        equipment_data = fallback.get(entity_id, {})
-        workshop_raw = row.get("workshop")
-        faena_raw = row.get("faena")
-        status_raw = row.get("status")
-        comments_raw = row.get("comments")
+    for entity_id, group in movement_history.groupby("entity_id", sort=False):
+        group = group.copy()
+        group["_has_both_dates"] = (
+            group["_movement_start"].notna() & group["_movement_end"].notna()
+        ).astype(int)
+        group["_movement_completeness"] = group[
+            ["start_date", "end_date", "workshop", "faena", "status", "comments"]
+        ].apply(lambda row: sum(not is_empty(value) for value in row), axis=1)
+
+        # Se prioriza un registro que tenga ambas fechas. En empate, gana la
+        # actualización/fila más reciente de la hoja Mov. equipos.
+        ordered = group.sort_values(
+            [
+                "_has_both_dates",
+                "_has_update",
+                "_update_parsed",
+                "_movement_completeness",
+                "_global_order",
+            ],
+            ascending=True,
+            na_position="first",
+        )
+        anchor = ordered.iloc[-1]
+
+        start = anchor.get("_movement_start")
+        end = anchor.get("_movement_end")
+        if pd.isna(start):
+            start = parse_date(_latest_movement_value(group, "start_date"))
+        if pd.isna(end):
+            end = parse_date(_latest_movement_value(group, "end_date"))
+
+        equipment_data = fallback.get(str(entity_id), {})
+
+        def movement_value(field: str, fallback_field: str, default: str = "N/A") -> str:
+            value = anchor.get(field)
+            if is_empty(value):
+                value = _latest_movement_value(group, field)
+            if is_empty(value):
+                value = equipment_data.get(fallback_field)
+            return clean_display(value, default=default)
+
+        workshop = movement_value("workshop", "workshop")
+        faena = movement_value("faena", "planned_faena")
+        status = movement_value("status", "status")
+        comments = movement_value("comments", "comments")
+        source_file = clean_display(anchor.get("_source_file"))
+        source_sheet = clean_display(anchor.get("_source_sheet"))
+
+        date_issue = ""
+        if start is not None and end is not None and end < start:
+            date_issue = "La fecha de subida es anterior a la fecha de bajada."
+
         rows.append(
             {
-                "entity_id": entity_id,
-                "equipment": equipment_data.get("equipment", entity_id),
+                "entity_id": str(entity_id),
+                "equipment": equipment_data.get("equipment", str(entity_id)),
                 "start_date": start,
                 "end_date": end,
-                "workshop": clean_display(workshop_raw, default=equipment_data.get("workshop", "N/A")),
-                "workshop_canonical": normalize_workshop(
-                    workshop_raw if not is_empty(workshop_raw) else equipment_data.get("workshop")
-                ),
-                "faena": clean_display(faena_raw, default=equipment_data.get("planned_faena", "N/A")),
-                "faena_canonical": canonical_contract(
-                    faena_raw if not is_empty(faena_raw) else equipment_data.get("planned_faena")
-                ),
-                "status": clean_display(status_raw, default=equipment_data.get("status", "N/A")),
-                "comments": clean_display(comments_raw, default=equipment_data.get("comments", "N/A")),
-                "update_date": row.get("_update_parsed"),
-                "source": f"{clean_display(row.get('_source_file'))}/{clean_display(row.get('_source_sheet'))}",
-                "source_row": row.get("_source_row"),
-                "_global_order": row.get("_global_order", 0),
+                "workshop": workshop,
+                "workshop_canonical": normalize_workshop(workshop),
+                "faena": faena,
+                "faena_canonical": canonical_contract(faena),
+                "status": status,
+                "comments": comments,
+                "update_date": anchor.get("_update_parsed"),
+                "source": f"{source_file}/{source_sheet}",
+                "source_file": source_file,
+                "source_sheet": source_sheet,
+                "source_row": anchor.get("_source_row"),
+                "date_issue": date_issue,
+                "_global_order": anchor.get("_global_order", 0),
             }
         )
 
     movements = pd.DataFrame(rows)
     if movements.empty:
         return movements
-    dedupe_columns = ["entity_id", "start_date", "end_date", "workshop_canonical", "faena_canonical"]
-    movements = movements.sort_values(["update_date", "_global_order"], na_position="first")
-    movements = movements.drop_duplicates(dedupe_columns, keep="last")
-    return movements.sort_values(["start_date", "end_date", "equipment"], na_position="last").reset_index(drop=True)
+    # Garantía final: un solo registro por camión.
+    movements = movements.sort_values(
+        ["update_date", "_global_order"], ascending=True, na_position="first"
+    ).drop_duplicates("entity_id", keep="last")
+    return movements.sort_values(
+        ["start_date", "end_date", "equipment"], na_position="last"
+    ).reset_index(drop=True)
+
+
+def apply_movement_plan_to_equipment(
+    equipment: pd.DataFrame,
+    movements: pd.DataFrame,
+) -> pd.DataFrame:
+    """Hace que las fechas válidas de la ficha sean solo las de Mov. equipos."""
+    if equipment.empty:
+        return equipment
+
+    result = equipment.copy()
+    result["start_date"] = pd.NaT
+    result["end_date"] = pd.NaT
+    result["movement_source"] = "Sin planificación en Mov. equipos"
+
+    if movements.empty:
+        return result
+
+    movement_by_entity = movements.set_index("entity_id")
+    for index, row in result.iterrows():
+        entity_id = str(row["entity_id"])
+        if entity_id not in movement_by_entity.index:
+            continue
+        movement = movement_by_entity.loc[entity_id]
+        if isinstance(movement, pd.DataFrame):
+            movement = movement.iloc[-1]
+        result.at[index, "start_date"] = movement.get("start_date")
+        result.at[index, "end_date"] = movement.get("end_date")
+        result.at[index, "movement_source"] = movement.get("source", "Mov. equipos")
+
+        # Para que la ficha y la auditoría IA usen el mismo plan semanal.
+        for target, source in (
+            ("workshop", "workshop"),
+            ("planned_faena", "faena"),
+            ("status", "status"),
+            ("comments", "comments"),
+        ):
+            value = movement.get(source)
+            if not is_empty(value):
+                result.at[index, target] = value
+    return result
+
+
+def _active_movements_on_day(movements: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
+    if movements.empty:
+        return movements
+    day = pd.Timestamp(day).normalize()
+    active = movements[
+        movements["start_date"].notna()
+        & (movements["start_date"] <= day)
+        & (movements["end_date"].isna() | (movements["end_date"] >= day))
+        & ~movements["status"].map(is_terminal_status)
+        & movements["workshop_canonical"].isin(WORKSHOP_CAPACITY)
+    ].copy()
+    if not active.empty:
+        active = active.sort_values(
+            ["start_date", "update_date", "_global_order"], na_position="first"
+        ).drop_duplicates("entity_id", keep="last")
+    return active
 
 
 def build_workshop_capacity(
@@ -493,18 +641,7 @@ def build_workshop_capacity(
     today: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     today = (today or pd.Timestamp.now()).normalize()
-    active = pd.DataFrame()
-    if not movements.empty:
-        active = movements[
-            movements["start_date"].notna()
-            & (movements["start_date"] <= today)
-            & (movements["end_date"].isna() | (movements["end_date"] >= today))
-            & ~movements["status"].map(is_terminal_status)
-            & movements["workshop_canonical"].isin(WORKSHOP_CAPACITY)
-        ].copy()
-        if not active.empty:
-            active = active.sort_values(["start_date", "update_date", "_global_order"], na_position="first")
-            active = active.drop_duplicates("entity_id", keep="last")
+    active = _active_movements_on_day(movements, today)
 
     rows: list[dict[str, Any]] = []
     for workshop, limit in WORKSHOP_CAPACITY.items():
@@ -526,6 +663,127 @@ def build_workshop_capacity(
         )
     return pd.DataFrame(rows)
 
+
+def build_weekly_workshop_projection(
+    movements: pd.DataFrame,
+    week_start: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Proyecta ocupación diaria, peak y cierre de cada taller para una semana."""
+    selected = (week_start or pd.Timestamp.now()).normalize()
+    monday = selected - pd.Timedelta(days=int(selected.weekday()))
+    sunday = monday + pd.Timedelta(days=6)
+    previous_day = monday - pd.Timedelta(days=1)
+    days = pd.date_range(monday, sunday, freq="D")
+
+    rows: list[dict[str, Any]] = []
+    for workshop, limit in WORKSHOP_CAPACITY.items():
+        opening_active = _active_movements_on_day(movements, previous_day)
+        opening = int((opening_active["workshop_canonical"] == workshop).sum()) if not opening_active.empty else 0
+
+        workshop_movements = movements[
+            movements["workshop_canonical"].eq(workshop)
+        ].copy() if not movements.empty else pd.DataFrame()
+
+        downs = 0
+        ups = 0
+        if not workshop_movements.empty:
+            downs = int(
+                workshop_movements.loc[
+                    workshop_movements["start_date"].between(monday, sunday, inclusive="both"),
+                    "entity_id",
+                ].nunique()
+            )
+            ups = int(
+                workshop_movements.loc[
+                    workshop_movements["end_date"].between(monday, sunday, inclusive="both"),
+                    "entity_id",
+                ].nunique()
+            )
+
+        daily_counts: list[tuple[pd.Timestamp, int, list[str]]] = []
+        for day in days:
+            active = _active_movements_on_day(movements, day)
+            workshop_active = active[active["workshop_canonical"].eq(workshop)] if not active.empty else active
+            names = sorted(workshop_active["equipment"].astype(str).unique().tolist()) if not workshop_active.empty else []
+            daily_counts.append((pd.Timestamp(day), len(names), names))
+
+        peak_day, peak, peak_equipment = max(daily_counts, key=lambda item: item[1])
+        closing = daily_counts[-1][1]
+        if peak > limit:
+            status = "Sobrepasado"
+        elif peak == limit:
+            status = "Al límite"
+        else:
+            status = "Con espacio"
+
+        rows.append(
+            {
+                "workshop": workshop,
+                "limit": limit,
+                "opening": opening,
+                "downs": downs,
+                "ups": ups,
+                "peak": peak,
+                "peak_date": peak_day,
+                "closing": closing,
+                "available_at_peak": max(limit - peak, 0),
+                "over_capacity": max(peak - limit, 0),
+                "status": status,
+                "peak_equipment": peak_equipment,
+                "week_start": monday,
+                "week_end": sunday,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+WORKSHOP_ALTERNATIVES: dict[str, tuple[str, ...]] = {
+    "RIO LOA": ("SKC CALAMA", "SKC ANTOFAGASTA", "SKC ALTO HOSPICIO", "FULL RPM"),
+    "SKC CALAMA": ("RIO LOA", "SKC ANTOFAGASTA", "SKC ALTO HOSPICIO", "FULL RPM"),
+    "SKC ANTOFAGASTA": ("FULL RPM", "SKC CALAMA", "RIO LOA", "SKC ALTO HOSPICIO"),
+    "SKC ALTO HOSPICIO": ("SKC CALAMA", "RIO LOA", "SKC ANTOFAGASTA", "FULL RPM"),
+    "SKC COPIAPO": ("SKC ANTOFAGASTA", "FULL RPM", "SKC CALAMA"),
+    "FULL RPM": ("SKC ANTOFAGASTA", "SKC CALAMA", "RIO LOA", "SKC ALTO HOSPICIO"),
+}
+
+
+def build_rebalancing_recommendations(projection: pd.DataFrame) -> list[str]:
+    """Recomendaciones determinísticas; la IA puede refinarlas sin alterar cifras."""
+    if projection.empty:
+        return []
+    indexed = projection.set_index("workshop")
+    recommendations: list[str] = []
+
+    overloaded = projection[projection["over_capacity"] > 0].sort_values(
+        ["over_capacity", "peak"], ascending=False
+    )
+    for _, row in overloaded.iterrows():
+        workshop = str(row["workshop"])
+        remaining = int(row["over_capacity"])
+        allocations: list[str] = []
+        for alternative in WORKSHOP_ALTERNATIVES.get(workshop, tuple(indexed.index)):
+            if alternative not in indexed.index or remaining <= 0:
+                continue
+            available = int(indexed.at[alternative, "available_at_peak"])
+            if available <= 0:
+                continue
+            moved = min(remaining, available)
+            allocations.append(f"{moved} a {alternative}")
+            remaining -= moved
+
+        base = (
+            f"{workshop} proyecta un máximo de {int(row['peak'])}/{int(row['limit'])} equipos "
+            f"(+{int(row['over_capacity'])} sobre capacidad)."
+        )
+        if allocations:
+            recommendation = base + " Opción de redistribución: " + ", ".join(allocations) + "."
+            if remaining > 0:
+                recommendation += f" Aún quedarían {remaining} equipo(s) sin cupo dentro de los talleres configurados."
+        else:
+            recommendation = base + " No se detectó capacidad libre suficiente en los talleres alternativos configurados."
+        recommendation += " Validar distancia, especialidad técnica, repuestos y autorización operacional antes de reasignar."
+        recommendations.append(recommendation)
+    return recommendations
 
 def build_contracts(gps: pd.DataFrame) -> pd.DataFrame:
     counts = gps["canonical_contract"].value_counts().to_dict() if not gps.empty else {}
@@ -600,8 +858,9 @@ def build_application_data(
     gps, gps_diagnostics = canonicalize_gps(gps_raw)
     history = assign_entities(history)
     equipment, search_aliases = consolidate_equipment(history, gps)
-    certifications = build_certifications(equipment)
     movements = build_movements(history, equipment)
+    equipment = apply_movement_plan_to_equipment(equipment, movements)
+    certifications = build_certifications(equipment)
     workshop_capacity = build_workshop_capacity(movements)
     contracts = build_contracts(gps)
 
@@ -614,6 +873,7 @@ def build_application_data(
             "equipment_total": len(equipment),
             "history_rows_canonical": len(history),
             "movement_rows": len(movements),
+            "movement_source_sheets": sorted(movements["source"].dropna().unique().tolist()) if not movements.empty else [],
             "settings": {
                 **asdict(settings),
                 "gps_api_key": "configurada" if settings.gps_api_key else "faltante",

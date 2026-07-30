@@ -7,6 +7,7 @@ from enaex.data_sources import detect_header_row
 from enaex.normalize import format_date, normalize_identifier, normalize_workshop, parse_date
 from enaex.processing import (
     build_application_data,
+    build_weekly_workshop_projection,
     canonical_contract,
     search_equipment_ids,
 )
@@ -156,7 +157,7 @@ def test_active_capacity_excludes_completed_status() -> None:
                 "Taller": "SKC Calama",
                 "Estado": "En proceso",
                 "_source_file": "Excel_1",
-                "_source_sheet": "Plan",
+                "_source_sheet": "Mov. equipos",
                 "_source_row": 2,
                 "_global_order": 0,
             },
@@ -167,7 +168,7 @@ def test_active_capacity_excludes_completed_status() -> None:
                 "Taller": "SKC Calama",
                 "Estado": "Finalizado",
                 "_source_file": "Excel_1",
-                "_source_sheet": "Plan",
+                "_source_sheet": "Mov. equipos",
                 "_source_row": 3,
                 "_global_order": 1,
             },
@@ -181,3 +182,80 @@ def test_active_capacity_excludes_completed_status() -> None:
 def test_search_by_plate() -> None:
     aliases = {"EQ00001": ["Quadra-70", "ABCD12"], "EQ00002": ["Auger-165", "WXYZ99"]}
     assert search_equipment_ids("ABCD-12", aliases)[0] == "EQ00001"
+
+
+def test_movements_only_use_mov_equipos_and_one_row_per_truck() -> None:
+    excel = pd.DataFrame(
+        [
+            {
+                "Equipo": "Quadra-1029",
+                "Fecha Inicio": "10/07/2026",
+                "Fecha Entrega": "12/07/2026",
+                "Taller": "Rio Loa",
+                "Faena": "Centinela",
+                "_source_file": "Excel_2",
+                "_source_sheet": "En proceso",
+                "_source_row": 2,
+                "_global_order": 0,
+            },
+            {
+                "Equipo": "Quadra-1029",
+                "Fecha Inicio": "15/07/2026",
+                "Fecha Entrega": "18/07/2026",
+                "Taller": "SKC Calama",
+                "Faena": "Sierra Gorda",
+                "Fecha actualización": "01/07/2026",
+                "_source_file": "Excel_2",
+                "_source_sheet": "Mov. equipos",
+                "_source_row": 3,
+                "_global_order": 1,
+            },
+            {
+                "Equipo": "Quadra-1029",
+                "Fecha Inicio": "16/07/2026",
+                "Fecha Entrega": "20/07/2026",
+                "Taller": "SKC Antofagasta",
+                "Faena": "Collahuasi",
+                "Fecha actualización": "02/07/2026",
+                "_source_file": "Excel_2",
+                "_source_sheet": "Mov. equipos",
+                "_source_row": 4,
+                "_global_order": 2,
+            },
+        ]
+    )
+    data = build_application_data(excel, pd.DataFrame(), settings())
+    assert len(data.movements) == 1
+    movement = data.movements.iloc[0]
+    assert movement["start_date"] == pd.Timestamp("2026-07-16")
+    assert movement["end_date"] == pd.Timestamp("2026-07-20")
+    assert movement["workshop_canonical"] == "SKC ANTOFAGASTA"
+    equipment = data.equipment.iloc[0]
+    assert equipment["start_date"] == pd.Timestamp("2026-07-16")
+    assert equipment["end_date"] == pd.Timestamp("2026-07-20")
+
+
+def test_weekly_projection_detects_over_capacity() -> None:
+    excel_rows = []
+    for index in range(3):
+        excel_rows.append(
+            {
+                "Equipo": f"E-{index + 1}",
+                "Fecha Inicio": "27/07/2026",
+                "Fecha Entrega": "02/08/2026",
+                "Taller": "Rio Loa",
+                "Faena": "Centinela",
+                "Estado": "En proceso",
+                "_source_file": "Excel_2",
+                "_source_sheet": "Mov. equipos",
+                "_source_row": index + 2,
+                "_global_order": index,
+            }
+        )
+    data = build_application_data(pd.DataFrame(excel_rows), pd.DataFrame(), settings())
+    projection = build_weekly_workshop_projection(data.movements, pd.Timestamp("2026-07-27"))
+    rio_loa = projection[projection["workshop"] == "RIO LOA"].iloc[0]
+    assert rio_loa["peak"] == 3
+    assert rio_loa["limit"] == 2
+    assert rio_loa["status"] == "Sobrepasado"
+    assert rio_loa["over_capacity"] == 1

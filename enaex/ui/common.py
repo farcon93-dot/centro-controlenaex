@@ -152,7 +152,7 @@ def render_equipment_card(row: pd.Series) -> None:
             )
 
         with plan_col:
-            st.markdown("#### 🗓️ Última planificación encontrada")
+            st.markdown("#### 🗓️ Planificación semanal — Mov. equipos")
             st.success(
                 f"📋 **Estatus:** {row.get('status', 'N/A')}  |  "
                 f"🔧 **Taller:** {row.get('workshop', 'N/A')}"
@@ -161,4 +161,4 @@ def render_equipment_card(row: pd.Series) -> None:
             st.markdown(f"**Bajada a taller:** {format_date(row.get('start_date'))}")
             st.markdown(f"**Subida/entrega a faena:** {format_date(row.get('end_date'))}")
             st.markdown(f"**Comentario o trabajo:** {row.get('comments', 'N/A')}")
-            st.caption(f"Origen consolidado: {row.get('sources', 'N/A')}")
+            st.caption(f"Fuente de fechas de movimiento: {row.get('movement_source', 'Sin planificación en Mov. equipos')}")

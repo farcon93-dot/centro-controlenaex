@@ -137,3 +137,97 @@ def friendly_ai_error(exc: Exception) -> str:
     if "timeout" in lowered or "timed out" in lowered:
         return "Gemini demoró demasiado en responder. Intenta nuevamente más tarde."
     return f"La auditoría IA no pudo ejecutarse: {text[:220]}"
+
+
+def suggest_workshop_capacity(
+    api_key: str,
+    model_name: str,
+    projection: pd.DataFrame,
+    movements: pd.DataFrame,
+    week_start: pd.Timestamp,
+    week_end: pd.Timestamp,
+) -> tuple[str | None, str | None]:
+    """Pide a Gemini una recomendación breve sin permitir que altere las cifras calculadas."""
+    if not api_key:
+        return None, "La IA está desactivada porque falta GEMINI_API_KEY."
+    if not model_name:
+        return None, "No existe un modelo Gemini disponible."
+    if projection.empty:
+        return None, "No existe una proyección de capacidad para analizar."
+
+    capacity_payload = []
+    for _, row in projection.iterrows():
+        capacity_payload.append(
+            {
+                "taller": row.get("workshop"),
+                "capacidad_maxima": int(row.get("limit", 0)),
+                "equipos_inicio_semana": int(row.get("opening", 0)),
+                "bajadas_semana": int(row.get("downs", 0)),
+                "subidas_semana": int(row.get("ups", 0)),
+                "maximo_proyectado": int(row.get("peak", 0)),
+                "cierre_semana": int(row.get("closing", 0)),
+                "sobre_capacidad": int(row.get("over_capacity", 0)),
+                "cupos_libres_en_peak": int(row.get("available_at_peak", 0)),
+                "equipos_en_peak": row.get("peak_equipment", []),
+            }
+        )
+
+    movement_payload = []
+    if not movements.empty:
+        mask = (
+            movements["start_date"].between(week_start, week_end, inclusive="both")
+            | movements["end_date"].between(week_start, week_end, inclusive="both")
+        )
+        for _, row in movements.loc[mask].iterrows():
+            movement_payload.append(
+                {
+                    "equipo": row.get("equipment"),
+                    "bajada": format_date(row.get("start_date")),
+                    "taller": row.get("workshop"),
+                    "subida": format_date(row.get("end_date")),
+                    "faena": row.get("faena"),
+                    "estatus": row.get("status"),
+                    "trabajo": row.get("comments"),
+                }
+            )
+
+    prompt = f"""
+Actúa como planificador de mantenimiento de flota minera.
+Analiza exclusivamente las cifras calculadas por la aplicación para la semana
+{format_date(week_start)} al {format_date(week_end)}.
+
+Reglas obligatorias:
+- No inventes capacidades, fechas, talleres, distancias ni disponibilidad.
+- No propongas enviar equipos a un taller que tenga 0 cupos libres en el peak.
+- Si un taller queda sobre capacidad, indica cuántos equipos conviene evaluar para reasignar.
+- Prioriza una solución práctica y breve, pero aclara que debe validarse compatibilidad técnica,
+  distancia, repuestos y autorización operacional.
+- Si no existe sobrecapacidad, indica que no se requiere redistribución y menciona el principal riesgo de la semana.
+- Entrega como máximo 8 líneas y usa viñetas.
+
+Proyección por taller:
+{json.dumps(capacity_payload, ensure_ascii=False, default=str)}
+
+Movimientos de la semana, provenientes únicamente de la hoja Mov. equipos:
+{json.dumps(movement_payload, ensure_ascii=False, default=str)}
+""".strip()
+
+    try:
+        client = get_gemini_client(api_key)
+        if client is None:
+            return None, "No fue posible crear el cliente de IA."
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=550,
+                system_instruction=(
+                    "Eres un planificador técnico conservador. No alteres cifras ni inventes datos."
+                ),
+            ),
+        )
+        text = (response.text or "").strip()
+        return (text or None), (None if text else "Gemini respondió sin texto.")
+    except Exception as exc:
+        return None, friendly_ai_error(exc)

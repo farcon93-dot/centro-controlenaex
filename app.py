@@ -53,7 +53,7 @@ def main() -> None:
     with tab_equipment:
         render_equipment_page(data, settings, ai_model)
     with tab_movements:
-        render_movements_page(data)
+        render_movements_page(data, settings, ai_model)
     with tab_faenas:
         render_faenas_page(data)
 
