@@ -63,6 +63,7 @@ def _format_mapping(mapping: dict[str, list[str]]) -> pd.DataFrame:
 def render_sidebar(data: ApplicationData, ai_model: str | None, ai_error: str | None, refresh_callback: Any) -> None:
     with st.sidebar:
         st.header("Estado del sistema")
+        st.caption("Versión 2026.07.30.3")
         st.metric("Equipos consolidados", len(data.equipment))
         st.metric("Equipos GPS únicos", len(data.gps))
         st.metric("Filas útiles del Excel", len(data.history))
@@ -133,7 +134,11 @@ def _certificate_label(row: pd.Series, date_field: str, days_field: str) -> str:
     if days is None or pd.isna(days):
         return date_text
     try:
-        return f"{date_text} ({int(days)} días)"
+        days_int = int(days)
+        suffix = "día restante" if abs(days_int) == 1 else "días restantes"
+        if days_int < 0:
+            suffix = "días vencida"
+        return f"{date_text} · {days_int} {suffix}"
     except (TypeError, ValueError):
         return date_text
 
@@ -148,8 +153,8 @@ def render_equipment_card(row: pd.Series) -> None:
             st.info(
                 f"📍 **Faena:** {row.get('gps_faena', 'N/A')}  |  "
                 f"🏭 **Lugar:** {row.get('gps_place', 'N/A')}  |  "
-                f"🧭 **Condición:** {row.get('gps_condition', row.get('condition', 'N/A'))}  |  "
-                f"⚙️ **Estado:** {row.get('gps_state', row.get('status', 'N/A'))}"
+                f"🧭 **Condición:** {row.get('gps_condition', 'N/A')}  |  "
+                f"⚙️ **Estado:** {row.get('gps_state', 'N/A')}"
             )
             c1, c2 = st.columns(2)
             c1.markdown(f"**Patente:** {row.get('plate', 'N/A')}")
@@ -171,30 +176,26 @@ def render_equipment_card(row: pd.Series) -> None:
         with plan_col:
             st.markdown("#### 🗓️ Planificación semanal")
             st.success(
-                f"📋 **Estado actual:** {row.get('status', 'N/A')}  |  "
+                f"📋 **Estatus en Mov. equipos:** {row.get('movement_status', 'N/A')}  |  "
                 f"🔧 **Taller planificado:** {row.get('planned_workshop', 'N/A')}"
             )
 
             status_detail = str(row.get("status_detail", "N/A"))
-            if "en proceso" in normalize_text(row.get("status")):
-                st.warning(f"**Detalle del estado En proceso:** {status_detail}")
+            if "en proceso" in normalize_text(row.get("gps_state")):
+                st.warning(f"**Comentario del estado En proceso:** {status_detail}")
             else:
-                st.markdown(f"**Detalle de Estado de equipos:** {status_detail}")
+                st.markdown(f"**Estado de equipos (planificación semanal):** {status_detail}")
 
             st.markdown(f"**Faena planificada:** {row.get('planned_faena', 'N/A')}")
             st.markdown(f"**Bajada a taller:** {format_date(row.get('start_date'))}")
             st.markdown(f"**Subida/entrega a faena:** {format_date(row.get('end_date'))}")
-            st.markdown(f"**Estatus en Mov. equipos:** {row.get('movement_status', 'N/A')}")
             st.markdown(f"**Trabajo/comentario de Mov. equipos:** {row.get('movement_comments', 'N/A')}")
-            st.caption(
-                f"Fuente de fechas: {row.get('movement_source', 'Sin planificación en Mov. equipos')}"
-            )
 
         recent = row.get("recent_works", [])
         with st.expander("🧰 Últimos trabajos, estados y bajadas registradas"):
             if isinstance(recent, list) and recent:
                 history = pd.DataFrame(recent)
-                preferred = ["fecha", "estado", "taller", "detalle", "hoja"]
+                preferred = ["fecha", "estado", "taller", "detalle"]
                 columns = [column for column in preferred if column in history.columns]
                 st.dataframe(
                     history[columns],

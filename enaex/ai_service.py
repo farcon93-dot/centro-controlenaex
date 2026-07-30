@@ -137,6 +137,61 @@ Datos ya mostrados en la aplicación:
         return None, friendly_ai_error(exc)
 
 
+
+def summarize_work_history(
+    api_key: str,
+    model_name: str,
+    equipment_row: pd.Series,
+) -> tuple[str | None, str | None]:
+    """Resume únicamente los trabajos históricos ya asociados al camión."""
+    if not api_key:
+        return None, "La IA está desactivada porque falta GEMINI_API_KEY."
+    if not model_name:
+        return None, "No existe un modelo Gemini disponible."
+
+    recent = equipment_row.get("recent_works", [])
+    if not isinstance(recent, list) or not recent:
+        return None, "No hay trabajos históricos suficientes para resumir."
+
+    payload = {
+        "equipo": equipment_row.get("equipment"),
+        "estado_actual": equipment_row.get("gps_state"),
+        "comentario_estado_actual": equipment_row.get("status_detail"),
+        "trabajos_historicos": recent,
+    }
+    prompt = f"""
+Analiza exclusivamente el historial técnico del equipo indicado.
+No inventes trabajos, causas, repuestos ni fechas.
+Agrupa registros repetidos o equivalentes y entrega un punteo claro de 3 a 8 viñetas.
+Prioriza: mantenimientos preventivos, correctivos, trabajos documentales, reparaciones y traslados.
+Cuando exista fecha válida, inclúyela.
+No menciones archivos, hojas, fuentes ni nombres internos de columnas.
+Si un texto está incompleto, indícalo como registro incompleto en vez de asumir.
+
+Datos:
+{json.dumps(payload, ensure_ascii=False, default=str)}
+""".strip()
+
+    try:
+        client = get_gemini_client(api_key)
+        if client is None:
+            return None, "No fue posible crear el cliente de IA."
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=500,
+                system_instruction=(
+                    "Eres un analista de mantenimiento. Resume solo hechos presentes en el historial."
+                ),
+            ),
+        )
+        text = (response.text or "").strip()
+        return (text or None), (None if text else "Gemini respondió sin texto.")
+    except Exception as exc:
+        return None, friendly_ai_error(exc)
+
 def friendly_ai_error(exc: Exception) -> str:
     text = str(exc)
     lowered = text.lower()

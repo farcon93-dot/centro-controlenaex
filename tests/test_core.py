@@ -384,3 +384,100 @@ def test_estado_de_equipos_and_recent_work_are_preserved() -> None:
     details = " ".join(item["detalle"] for item in row["recent_works"])
     assert "Cambio de bomba" in details
     assert "MP 900" in details
+
+
+def test_api_prefers_estado_deducido_and_never_uses_certification_number_as_status() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "nombre": "QUADRA-1060 AT Ex",
+                "nombre_faena": "Radomiro Tomic",
+                "Estado": 109,
+                "Estado_Deducido": "OK",
+                "Lugar": "Faena",
+                "Condicion": "Operativo",
+                "D. RT": 17,
+                "D. Sernageomin": 61,
+                "D. DGMN": 67,
+                "Fecha Aprox. Proxima Mantencion": "30-07-2026 (450)",
+                "marca_nombre": "ASTRA",
+                "Sistema Control": "E-BLAST",
+                "horas_ult": 510,
+            }
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["gps_state"] == "OK"
+    assert row["gps_place"] == "Faena"
+    assert row["gps_condition"] == "Operativo"
+    assert row["revision_tecnica_days"] == 17
+    assert row["sernageomin_days"] == 61
+    assert row["dgmn_days"] == 67
+    assert pd.Timestamp(row["next_maintenance_date"]) == pd.Timestamp("2026-07-30")
+
+
+def test_api_duplicate_rows_are_merged_field_by_field() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "nombre": "QUADRA-1060 AT Ex",
+                "nombre_faena": "Radomiro Tomic",
+                "Estado_Deducido": "OK",
+                "Lugar": "Faena",
+                "_gps_response_order": 0,
+            },
+            {
+                "nombre": "QUADRA-1060 AT Ex",
+                "D. RT": 17,
+                "D. Sernageomin": 61,
+                "D. DGMN": 67,
+                "Fecha Aprox. Proxima Mantencion": "30-07-2026 (450)",
+                "Sistema Control": "E-BLAST",
+                "_gps_response_order": 1,
+            },
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    assert len(data.gps) == 1
+    row = data.equipment.iloc[0]
+    assert row["gps_state"] == "OK"
+    assert row["gps_place"] == "Faena"
+    assert row["revision_tecnica_days"] == 17
+    assert row["control_system"] == "E-BLAST"
+
+
+def test_movement_status_does_not_replace_current_api_status() -> None:
+    excel = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-1060 AT Ex",
+                "Estado": "Pendiente",
+                "Fecha Inicio": "01/08/2026",
+                "Fecha Entrega": "10/08/2026",
+                "Taller": "SKC Calama",
+                "_source_file": "Excel_2",
+                "_source_sheet": "Mov. equipos",
+                "_source_row": 2,
+                "_global_order": 0,
+            }
+        ]
+    )
+    gps = pd.DataFrame(
+        [
+            {
+                "nombre": "QUADRA-1060 AT Ex",
+                "Estado_Deducido": "OK",
+                "Lugar": "Faena",
+            }
+        ]
+    )
+    data = build_application_data(excel, gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["gps_state"] == "OK"
+    assert row["status"] == "OK"
+    assert row["movement_status"] == "Pendiente"
+
+
+def test_date_with_maintenance_cycle_in_parentheses() -> None:
+    assert format_date("30-07-2026 (450)") == "30/07/2026"

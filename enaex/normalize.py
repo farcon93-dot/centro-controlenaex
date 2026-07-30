@@ -74,6 +74,17 @@ def parse_date(value: Any) -> pd.Timestamp | None:
         if 20_000 <= number <= 80_000:
             return (pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")).normalize()
 
+    # La API puede entregar valores como "30-07-2026 (450)". Se extrae
+    # primero la fecha visible y se ignora el ciclo/intervalo entre paréntesis.
+    date_match = re.search(
+        r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b",
+        text,
+    )
+    if date_match:
+        parsed_match = pd.to_datetime(date_match.group(1), dayfirst=True, errors="coerce")
+        if not pd.isna(parsed_match):
+            return pd.Timestamp(parsed_match).normalize()
+
     parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
     if pd.isna(parsed):
         return None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from enaex.ai_service import audit_equipment
+from enaex.ai_service import audit_equipment, summarize_work_history
 from enaex.configuration import Settings
 from enaex.models import ApplicationData
 from enaex.processing import search_equipment_ids
@@ -13,6 +13,7 @@ SEARCH_STATE_KEY = "enaex_search_entity_ids"
 SEARCH_NOT_FOUND_KEY = "enaex_search_not_found"
 AI_RESULT_KEY = "enaex_ai_result"
 SEARCH_QUERY_KEY = "enaex_search_query"
+HISTORY_AI_RESULTS_KEY = "enaex_history_ai_results"
 
 
 def render_equipment_page(
@@ -46,6 +47,7 @@ def render_equipment_page(
         st.session_state[SEARCH_STATE_KEY] = selected_ids
         st.session_state[SEARCH_NOT_FOUND_KEY] = not_found
         st.session_state.pop(AI_RESULT_KEY, None)
+        st.session_state[HISTORY_AI_RESULTS_KEY] = {}
 
     selected_ids = st.session_state.get(SEARCH_STATE_KEY, [])
     not_found = st.session_state.get(SEARCH_NOT_FOUND_KEY, [])
@@ -64,8 +66,37 @@ def render_equipment_page(
     selected["_order"] = selected["entity_id"].map({entity_id: index for index, entity_id in enumerate(selected_ids)})
     selected = selected.sort_values("_order").drop(columns="_order")
 
+    history_results = st.session_state.setdefault(HISTORY_AI_RESULTS_KEY, {})
     for _, row in selected.iterrows():
         render_equipment_card(row)
+        entity_id = str(row.get("entity_id"))
+        with st.container(border=True):
+            st.markdown("#### 🤖 Punteo de trabajos históricos")
+            st.caption(
+                "Gemini agrupa los registros asociados a este camión y resume solo los trabajos que ya existen en el historial."
+            )
+            if not settings.gemini_api_key:
+                st.info("La IA está desactivada. La ficha y el historial continúan funcionando sin Gemini.")
+            elif not ai_model:
+                st.warning("No se encontró un modelo Gemini compatible con tu clave.")
+            elif st.button(
+                "Analizar trabajos históricos con IA",
+                key=f"history_ai_button_{entity_id}",
+                use_container_width=True,
+            ):
+                with st.spinner("Gemini está ordenando y agrupando el historial técnico..."):
+                    result, error = summarize_work_history(
+                        settings.gemini_api_key, ai_model, row
+                    )
+                history_results[entity_id] = {"result": result, "error": error}
+                st.session_state[HISTORY_AI_RESULTS_KEY] = history_results
+
+            history_state = history_results.get(entity_id)
+            if history_state:
+                if history_state.get("error"):
+                    st.warning(history_state["error"])
+                elif history_state.get("result"):
+                    st.info(history_state["result"])
 
     st.subheader("🤖 Auditoría automática opcional")
     st.caption("La IA solo analiza las fichas que ya ves. Excel y GPS no dependen de Gemini.")

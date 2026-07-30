@@ -156,7 +156,7 @@ def _identifier_alias_variants(value: Any) -> set[str]:
     return variants
 
 
-def _build_recent_work_history(group: pd.DataFrame, limit: int = 6) -> list[dict[str, Any]]:
+def _build_recent_work_history(group: pd.DataFrame, limit: int = 10) -> list[dict[str, Any]]:
     """Recupera últimos trabajos/estados sin inventar ni mezclar otros equipos."""
     if group.empty:
         return []
@@ -175,12 +175,15 @@ def _build_recent_work_history(group: pd.DataFrame, limit: int = 6) -> list[dict
         if not detail and not comments:
             continue
         event_date = (
-            parse_date(row.get("update_date"))
-            or parse_date(row.get("end_date"))
+            parse_date(row.get("end_date"))
             or parse_date(row.get("start_date"))
+            or parse_date(row.get("update_date"))
         )
-        source_sheet = clean_display(row.get("_source_sheet"), default="")
-        text = detail or comments
+        text_parts: list[str] = []
+        for candidate in (detail, comments):
+            if candidate and normalize_text(candidate) not in {normalize_text(item) for item in text_parts}:
+                text_parts.append(candidate)
+        text = " | ".join(text_parts)
         key = (format_date(event_date), normalize_text(text), normalize_text(workshop))
         if key in seen:
             continue
@@ -191,12 +194,16 @@ def _build_recent_work_history(group: pd.DataFrame, limit: int = 6) -> list[dict
                 "estado": status or "N/A",
                 "taller": workshop or "N/A",
                 "detalle": text,
-                "hoja": source_sheet or "N/A",
             }
         )
-        if len(results) >= limit:
+        if len(results) >= max(limit * 3, limit):
             break
-    return results
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, pd.Timestamp]:
+        parsed = parse_date(item.get("fecha"))
+        return (1 if parsed is not None else 0, parsed or pd.Timestamp.min)
+
+    return sorted(results, key=sort_key, reverse=True)[:limit]
 
 
 def _coalesce(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
@@ -266,44 +273,116 @@ def _gps_identity(row: pd.Series) -> str:
     return ""
 
 
+def _valid_gps_field_value(field: str, value: Any) -> bool:
+    """Descarta valores incompatibles con el campo antes de consolidar la API."""
+    if is_empty(value):
+        return False
+    text = clean_display(value, default="")
+    normalized = normalize_text(text)
+    if field in {"status", "condition", "place", "faena", "brand", "model", "control_system"}:
+        # Un Estado 47/109 es realmente un día de certificación mal asociado.
+        if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", text.strip()):
+            return False
+    if field == "status":
+        rejected = ("sernageomin", "sngm", "dgmn", "revision tecnica", "dias", "mantencion")
+        if any(token in normalized for token in rejected):
+            return False
+    if field in {"revision_tecnica_days", "sernageomin_days", "dgmn_days", "days_out_service"}:
+        return parse_days_remaining(value) is not None
+    if field in {
+        "revision_tecnica_date", "sernageomin_date", "dgmn_date",
+        "return_operation_date", "next_maintenance_date", "timestamp",
+    }:
+        return parse_date(value) is not None
+    return True
+
+
+def _pick_gps_group_value(group: pd.DataFrame, field: str) -> Any:
+    """Obtiene el dato más confiable de todos los registros API del mismo camión."""
+    ordered = group.sort_values(
+        ["_has_timestamp", "timestamp_parsed", "_completeness", "_gps_response_order"],
+        ascending=True,
+        na_position="first",
+    )
+    for value in reversed(ordered[field].tolist()):
+        if _valid_gps_field_value(field, value):
+            return value
+    return pd.NA
+
+
 def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     if gps_raw.empty:
         return pd.DataFrame(), {"gps_column_mapping": {}, "gps_column_candidates": {}}
 
     mapping, details = match_columns(gps_raw.columns, GPS_FIELD_ALIASES, threshold=80.0)
-    gps = pd.DataFrame(index=gps_raw.index)
+    gps_rows = pd.DataFrame(index=gps_raw.index)
     for field in GPS_CANONICAL_FIELDS:
-        gps[field] = _coalesce(gps_raw, mapping.get(field, []))
+        gps_rows[field] = _coalesce(gps_raw, mapping.get(field, []))
 
     for column in ("_gps_type", "_gps_zone", "_gps_response_order"):
         if column in gps_raw.columns:
-            gps[column] = gps_raw[column]
-    if "_gps_response_order" not in gps.columns:
-        gps["_gps_response_order"] = range(len(gps))
+            gps_rows[column] = gps_raw[column]
+    if "_gps_response_order" not in gps_rows.columns:
+        gps_rows["_gps_response_order"] = range(len(gps_rows))
 
-    gps["equipment_key"] = gps["equipment"].map(normalize_identifier)
-    gps["plate_key"] = gps["plate"].map(normalize_identifier)
-    gps["vin_key"] = gps["vin"].map(normalize_identifier)
-    gps["gps_identity_key"] = gps.apply(_gps_identity, axis=1)
-    gps = gps[gps["gps_identity_key"].ne("")].copy()
+    gps_rows["equipment_key"] = gps_rows["equipment"].map(normalize_identifier)
+    gps_rows["plate_key"] = gps_rows["plate"].map(normalize_identifier)
+    gps_rows["vin_key"] = gps_rows["vin"].map(normalize_identifier)
+    gps_rows["gps_identity_key"] = gps_rows.apply(_gps_identity, axis=1)
+    gps_rows = gps_rows[gps_rows["gps_identity_key"].ne("")].copy()
 
-    gps["timestamp_parsed"] = gps["timestamp"].map(parse_date)
-    gps["_has_timestamp"] = gps["timestamp_parsed"].notna().astype(int)
+    gps_rows["timestamp_parsed"] = gps_rows["timestamp"].map(parse_date)
+    gps_rows["_has_timestamp"] = gps_rows["timestamp_parsed"].notna().astype(int)
     completeness_fields = [
         "equipment", "plate", "vin", "faena", "place", "condition", "brand", "model",
         "control_system", "hours", "status", "return_operation_date", "days_out_service",
         "next_maintenance_date", "revision_tecnica_date", "sernageomin_date", "dgmn_date",
         "revision_tecnica_days", "sernageomin_days", "dgmn_days",
     ]
-    gps["_completeness"] = gps[completeness_fields].apply(
-        lambda row: sum(not is_empty(value) for value in row), axis=1
+    gps_rows["_completeness"] = gps_rows[completeness_fields].apply(
+        lambda row: sum(_valid_gps_field_value(field, row.get(field)) for field in completeness_fields),
+        axis=1,
     )
-    gps = gps.sort_values(
-        ["gps_identity_key", "_has_timestamp", "timestamp_parsed", "_completeness", "_gps_response_order"],
-        ascending=True,
-        na_position="first",
-    )
-    gps = gps.drop_duplicates("gps_identity_key", keep="last").reset_index(drop=True)
+
+    # Un camión puede llegar repetido desde varios tipos/zonas de la API. En vez
+    # de elegir una sola fila (y perder Lugar, Estado o certificaciones), se unen
+    # campo por campo todos sus registros válidos.
+    consolidated: list[dict[str, Any]] = []
+    rejected_numeric_status = 0
+    for identity, group in gps_rows.groupby("gps_identity_key", sort=False):
+        record: dict[str, Any] = {"gps_identity_key": identity}
+        for field in GPS_CANONICAL_FIELDS:
+            record[field] = _pick_gps_group_value(group, field)
+        numeric_statuses = [
+            value for value in group["status"].tolist()
+            if not is_empty(value) and re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", str(value).strip())
+        ]
+        rejected_numeric_status += len(numeric_statuses)
+        best_row = group.sort_values(
+            ["_has_timestamp", "timestamp_parsed", "_completeness", "_gps_response_order"],
+            ascending=True,
+            na_position="first",
+        ).iloc[-1]
+        record["equipment_key"] = normalize_identifier(record.get("equipment"))
+        record["plate_key"] = normalize_identifier(record.get("plate"))
+        record["vin_key"] = normalize_identifier(record.get("vin"))
+        record["timestamp_parsed"] = parse_date(record.get("timestamp")) or best_row.get("timestamp_parsed")
+        record["_has_timestamp"] = int(record["timestamp_parsed"] is not None and not pd.isna(record["timestamp_parsed"]))
+        record["_completeness"] = sum(
+            _valid_gps_field_value(field, record.get(field)) for field in completeness_fields
+        )
+        record["_gps_response_order"] = best_row.get("_gps_response_order", 0)
+        record["_gps_type"] = best_row.get("_gps_type")
+        record["_gps_zone"] = best_row.get("_gps_zone")
+        consolidated.append(record)
+
+    gps = pd.DataFrame(consolidated)
+    if gps.empty:
+        return gps, {
+            "gps_column_mapping": mapping,
+            "gps_column_candidates": details,
+            "gps_rows_unique": 0,
+        }
     gps["canonical_contract"] = gps["faena"].map(canonical_contract)
 
     diagnostics = {
@@ -312,10 +391,11 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
             field: [{"columna": column, "puntaje": round(score, 1)} for column, score in candidates]
             for field, candidates in details.items()
         },
+        "gps_rows_received": len(gps_rows),
         "gps_rows_unique": len(gps),
+        "gps_numeric_status_values_rejected": rejected_numeric_status,
     }
-    return gps, diagnostics
-
+    return gps.reset_index(drop=True), diagnostics
 
 def assign_entities(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
@@ -496,7 +576,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "control_system": api_control or clean_display(excel_control),
                 "excel_hours": clean_display(latest["hours"]),
                 # Estado actual exacto del sistema de planificación/API.
-                "status": gps_status or excel_status or "N/A",
+                "status": gps_status or "N/A",
                 "condition": gps_condition or "N/A",
                 "planning_status": excel_status or "N/A",
                 "status_detail": clean_display(status_detail),
@@ -584,7 +664,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "capacity": "N/A",
                 "control_system": clean_display(gps_row.get("control_system")),
                 "excel_hours": "N/A",
-                "status": clean_display(gps_row.get("status")),
+                "status": clean_display(gps_row.get("status"), default="N/A"),
                 "condition": clean_display(gps_row.get("condition")),
                 "planning_status": "N/A",
                 "status_detail": "N/A",
@@ -613,7 +693,7 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
                 "gps_faena": clean_display(gps_row.get("faena")),
                 "gps_place": clean_display(gps_row.get("place")),
                 "gps_contract": str(gps_row.get("canonical_contract")),
-                "gps_state": clean_display(gps_row.get("status")),
+                "gps_state": clean_display(gps_row.get("status"), default="N/A"),
                 "gps_condition": clean_display(gps_row.get("condition")),
                 "gps_hours": clean_display(gps_row.get("hours")),
                 "gps_brand": clean_display(gps_row.get("brand")),

@@ -104,11 +104,17 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "nombre faena", "nombre_faena", "faena", "contrato", "zona nombre",
     ),
     "place": (
-        "lugar", "lugar actual", "ubicacion actual", "ubicación actual",
-        "ubicacion fisica", "ubicación física", "taller actual", "localizacion",
-        "localización",
+        "lugar", "nombre lugar", "nombre_lugar", "lugar nombre", "lugar_nombre",
+        "lugar actual", "lugar equipo", "ubicacion", "ubicación",
+        "ubicacion actual", "ubicación actual", "ubicacion nombre", "ubicación nombre",
+        "ubicacion_nombre", "ubicacion fisica", "ubicación física",
+        "taller actual", "localizacion", "localización", "localizacion nombre",
     ),
-    "condition": ("condicion", "condición"),
+    "condition": (
+        "condicion", "condición", "nombre condicion", "nombre condición",
+        "nombre_condicion", "condicion nombre", "condición nombre", "condicion_nombre",
+        "condicion equipo", "condición equipo", "tipo condicion", "tipo condición",
+    ),
     "brand": ("marca nombre", "marca_nombre", "marca", "fabricante"),
     "model": (
         "modelo nombre", "modelo_nombre", "modelo equipo", "modelo camion", "modelo camión",
@@ -122,18 +128,26 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "hrs kms desde ultimo preventivo", "hrs kms desde último preventivo",
         "hrs desde ultimo preventivo", "kms desde ultimo preventivo",
     ),
-    "status": ("estado", "estado equipo", "estado actual", "status"),
+    "status": (
+        "estado deducido", "estado_deducido", "estado equipo deducido",
+        "estado", "estado equipo", "estado actual", "nombre estado", "nombre_estado",
+        "estatus actual", "status",
+    ),
     "return_operation_date": (
-        "fecha retorno operacion", "fecha retorno operación", "retorno operacion",
-        "retorno operación",
+        "fecha retorno operacion", "fecha retorno operación", "fecha_retorno_operacion",
+        "retorno operacion", "retorno operación", "retorno_operacion",
     ),
     "days_out_service": (
         "dias fuera de servicio", "días fuera de servicio", "dias fs", "días fs",
     ),
     "next_maintenance_date": (
         "fecha aprox proxima mantencion", "fecha aprox próxima mantención",
-        "fecha proxima mantencion", "fecha próxima mantención", "proxima mantencion",
-        "próxima mantención",
+        "fecha_aprox_proxima_mantencion", "fecha aprox prox mantencion",
+        "fecha_aprox_prox_mantencion", "fecha proxima mantencion",
+        "fecha próxima mantención", "fecha_proxima_mantencion",
+        "fecha mantencion", "fecha mantención", "fecha_mantencion",
+        "fecha prox mantencion", "fecha_prox_mantencion",
+        "proxima mantencion", "próxima mantención", "prox mantencion", "prox mant",
     ),
     "revision_tecnica_date": (
         "fecha rt", "fecha revision tecnica", "fecha revisión técnica",
@@ -144,15 +158,22 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "dgmn_date": ("fecha dgmn", "vencimiento dgmn"),
     "revision_tecnica_days": (
-        "d rt", "d. rt", "dias rt", "días rt", "dias revision tecnica",
-        "días revisión técnica", "dias revisión técnica",
+        "d rt", "d. rt", "d_rt", "rt", "dias rt", "días rt", "dias_rt",
+        "dias restantes rt", "dias_restantes_rt",
+        "rt dias", "rt_dias", "dias revision tecnica", "días revisión técnica",
+        "dias revisión técnica", "dias_revision_tecnica",
     ),
     "sernageomin_days": (
-        "d sernageomin", "d. sernageomin", "dias sernageomin", "días sernageomin",
-        "d sngm", "d. sngm", "dias sngm", "días sngm",
+        "d sernageomin", "d. sernageomin", "d_sernageomin", "sernageomin",
+        "dias sernageomin", "días sernageomin", "dias_sernageomin",
+        "sernageomin dias", "sernageomin_dias", "dias restantes sernageomin",
+        "dias_restantes_sernageomin", "d sngm", "d. sngm", "d_sngm", "sngm",
+        "dias sngm", "días sngm", "dias_sngm",
     ),
     "dgmn_days": (
-        "d dgmn", "d. dgmn", "dias dgmn", "días dgmn",
+        "d dgmn", "d. dgmn", "d_dgmn", "dgmn", "dias dgmn", "días dgmn",
+        "dias restantes dgmn", "dias_restantes_dgmn",
+        "dias_dgmn", "dgmn dias", "dgmn_dias",
     ),
     "timestamp": (
         "fecha ultima", "fecha_ultima", "ultima fecha", "timestamp", "fecha gps",
@@ -178,10 +199,35 @@ HEADER_EXCLUSIONS: dict[str, tuple[str, ...]] = {
 GPS_HEADER_EXCLUSIONS: dict[str, tuple[str, ...]] = {
     "model": ("neumatic", "neumático", "repuesto", "componente"),
     "faena": ("fecha", "retorno"),
-    "status": ("condicion", "condición"),
+    "place": ("fecha", "retorno", "mantencion", "mantención"),
+    "condition": ("estado", "rt", "sernageomin", "sngm", "dgmn", "dias", "días"),
+    "status": (
+        "condicion", "condición", "rt", "revision", "revisión", "sernageomin",
+        "sngm", "dgmn", "dias", "días", "mantencion", "mantención",
+        "fuera de servicio", "hrs", "kms",
+    ),
     "revision_tecnica_date": ("dias", "días", "d rt"),
     "sernageomin_date": ("dias", "días", "d sernageomin", "d sngm"),
     "dgmn_date": ("dias", "días", "d dgmn"),
+}
+
+# Para estos campos no se admite una columna “parecida” sin la palabra esencial.
+# Esto evita, por ejemplo, interpretar D. Sernageomin como Estado.
+GPS_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
+    "place": ("lugar", "ubicacion", "localizacion", "taller"),
+    "condition": ("condicion",),
+    "status": ("estado", "status", "estatus"),
+    "revision_tecnica_days": ("rt", "revision tecnica"),
+    "sernageomin_days": ("sernageomin", "sngm"),
+    "dgmn_days": ("dgmn",),
+    "next_maintenance_date": ("mantencion", "mantenimiento"),
+    "return_operation_date": ("retorno",),
+}
+
+GPS_SINGLE_SOURCE_FIELDS = {
+    "place", "condition", "status", "return_operation_date", "days_out_service",
+    "next_maintenance_date", "revision_tecnica_date", "sernageomin_date", "dgmn_date",
+    "revision_tecnica_days", "sernageomin_days", "dgmn_days",
 }
 
 FIELD_MIN_SCORE: dict[str, float] = {
@@ -274,14 +320,30 @@ def match_columns(
     for field, aliases in aliases_by_field.items():
         candidates: list[tuple[str, float]] = []
         field_threshold = max(threshold, minimums.get(field, threshold))
+        exact_candidates: list[tuple[str, float]] = []
+        normalized_aliases = [normalize_text(alias) for alias in aliases]
+        alias_priority = {alias: index for index, alias in enumerate(normalized_aliases)}
+        required_tokens = GPS_REQUIRED_TOKENS.get(field, ()) if is_gps else ()
         for column in string_columns:
             if _is_excluded(field, column, exclusions):
+                continue
+            normalized_column = normalize_text(column)
+            if required_tokens and not any(normalize_text(token) in normalized_column for token in required_tokens):
+                continue
+            if normalized_column in alias_priority:
+                # Respeta el orden de alias: Estado_Deducido tiene prioridad sobre Estado.
+                exact_candidates.append((column, 110.0 - alias_priority[normalized_column] * 0.1))
                 continue
             best = max((_score_header(column, alias) for alias in aliases), default=0.0)
             if best >= field_threshold:
                 candidates.append((column, best))
-        candidates.sort(key=lambda item: (-item[1], len(item[0])))
-        details[field] = candidates[:max_per_field]
-        mapping[field] = [column for column, _ in candidates[:max_per_field]]
+
+        # Una coincidencia exacta es fuente de verdad y no se mezcla con columnas
+        # “parecidas”. Así Estado_Deducido no termina combinado con Estado_RT.
+        selected = exact_candidates if exact_candidates else candidates
+        selected.sort(key=lambda item: (-item[1], len(item[0])))
+        limit = 1 if is_gps and field in GPS_SINGLE_SOURCE_FIELDS else max_per_field
+        details[field] = selected[:limit]
+        mapping[field] = [column for column, _ in selected[:limit]]
 
     return dict(mapping), dict(details)
