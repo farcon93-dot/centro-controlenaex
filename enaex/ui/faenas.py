@@ -6,17 +6,27 @@ import streamlit as st
 from enaex.configuration import CONTRACT_TARGETS
 from enaex.models import ApplicationData
 from enaex.normalize import format_date
-from enaex.processing import FACTORY_TRUCK_LABEL, POLVORIN_LABEL, OTHER_EQUIPMENT_LABEL, equipment_category
+from enaex.processing import (
+    FACTORY_TRUCK_LABEL,
+    POLVORIN_LABEL,
+    OTHER_EQUIPMENT_LABEL,
+    equipment_category,
+    is_factory_truck,
+    is_polvorin,
+)
 
 
-def _category_series(frame: pd.DataFrame) -> pd.Series:
-    if "equipment_category" in frame.columns:
-        return frame["equipment_category"].fillna(OTHER_EQUIPMENT_LABEL)
-    return frame.get("equipment", pd.Series(index=frame.index, dtype="object")).map(equipment_category)
+def _classify(frame: pd.DataFrame) -> pd.Series:
+    """Recalcula la categoría desde el NOMBRE del equipo; no confía en caché previa."""
+    if frame.empty or "equipment" not in frame.columns:
+        return pd.Series(index=frame.index, dtype="object")
+    return frame["equipment"].map(equipment_category)
 
 
 def render_faenas_page(data: ApplicationData) -> None:
     st.header("📍 Vista Global de Faenas")
+    st.caption("Contrato = SOLO camiones fábrica cuyo código comienza por AUGER o QUADRA. AFI, PMO/PMOCAM y otros equipos no suman al objetivo.")
+
     active = sorted(data.gps["canonical_contract"].dropna().astype(str).unique().tolist()) if not data.gps.empty else []
     options = sorted(set(CONTRACT_TARGETS) | set(active))
     selected = st.selectbox("Selecciona la Faena / Contrato", ["(Elige una Faena)"] + options)
@@ -25,21 +35,30 @@ def render_faenas_page(data: ApplicationData) -> None:
 
     gps_filtered = data.gps[data.gps["canonical_contract"] == selected].copy() if not data.gps.empty else pd.DataFrame()
     if not gps_filtered.empty:
-        gps_filtered["equipment_category"] = _category_series(gps_filtered)
+        gps_filtered["equipment_category"] = _classify(gps_filtered)
 
-    factory = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(FACTORY_TRUCK_LABEL)] if not gps_filtered.empty else pd.DataFrame()
-    polvorines = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(POLVORIN_LABEL)] if not gps_filtered.empty else pd.DataFrame()
-    others = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(OTHER_EQUIPMENT_LABEL)] if not gps_filtered.empty else pd.DataFrame()
+    factory_mask = gps_filtered["equipment"].map(is_factory_truck).fillna(False) if not gps_filtered.empty and "equipment" in gps_filtered.columns else pd.Series(False, index=gps_filtered.index)
+    polvorin_mask = gps_filtered["equipment"].map(is_polvorin).fillna(False) if not gps_filtered.empty and "equipment" in gps_filtered.columns else pd.Series(False, index=gps_filtered.index)
+    factory = gps_filtered.loc[factory_mask].copy() if not gps_filtered.empty else pd.DataFrame()
+    polvorines = gps_filtered.loc[polvorin_mask].copy() if not gps_filtered.empty else pd.DataFrame()
+    others = gps_filtered.loc[~factory_mask & ~polvorin_mask].copy() if not gps_filtered.empty else pd.DataFrame()
+
+    # Un camión fábrica se cuenta una sola vez aunque la API lo entregue duplicado.
+    if not factory.empty:
+        if "equipment_key" in factory.columns:
+            factory = factory.drop_duplicates(subset=["equipment_key"], keep="last")
+        else:
+            factory = factory.drop_duplicates(subset=["equipment"], keep="last")
 
     actual_contract = len(factory)
     target = CONTRACT_TARGETS.get(selected)
 
     st.subheader(f"Análisis de contrato: {selected}")
     first, second, third, fourth = st.columns(4)
-    first.metric("Camiones fábrica (contrato)", actual_contract)
+    first.metric("🚛 Camiones fábrica (AUGER/QUADRA)", actual_contract)
     second.metric("Objetivo contractual", target if target is not None else "Sin objetivo")
     third.metric("Diferencia", actual_contract - target if target is not None else "N/A")
-    fourth.metric("Polvorines PMO / PMOCAM", len(polvorines))
+    fourth.metric("🧨 Polvorines PMO / PMOCAM", len(polvorines))
 
     if target is not None:
         if actual_contract < target:
@@ -49,8 +68,11 @@ def render_faenas_page(data: ApplicationData) -> None:
         else:
             st.success(f"El contrato tiene {actual_contract - target} camiones fábrica sobre el objetivo.")
 
-    if len(others):
-        st.caption(f"Además se detectan {len(others)} equipos de otros tipos. No se consideran en el objetivo contractual.")
+    st.caption(
+        f"Inventario visible en esta faena: {len(gps_filtered)} equipos = "
+        f"{actual_contract} camiones fábrica + {len(polvorines)} polvorines + {len(others)} otros. "
+        "Solo el primer grupo cuenta para el contrato."
+    )
 
     if gps_filtered.empty:
         st.info(f"No hay equipos GPS reportando en {selected}.")
@@ -59,7 +81,7 @@ def render_faenas_page(data: ApplicationData) -> None:
     st.markdown("### Equipos reportados en la faena")
     display = pd.DataFrame(
         {
-            "Tipo": gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")),
+            "Tipo": gps_filtered["equipment_category"],
             "Equipo": gps_filtered.get("equipment", pd.Series(index=gps_filtered.index, dtype="object")),
             "Patente": gps_filtered.get("plate", pd.Series(index=gps_filtered.index, dtype="object")),
             "Marca": gps_filtered.get("brand", pd.Series(index=gps_filtered.index, dtype="object")),

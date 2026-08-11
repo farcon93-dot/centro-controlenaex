@@ -63,7 +63,7 @@ def _format_mapping(mapping: dict[str, list[str]]) -> pd.DataFrame:
 def render_sidebar(data: ApplicationData, ai_model: str | None, ai_error: str | None, refresh_callback: Any) -> None:
     with st.sidebar:
         st.header("Estado del sistema")
-        st.caption("Versión 2026.08.11.1")
+        st.caption("Versión 2026.08.11.2 · HOTFIX CONTRATOS")
         st.metric("Equipos consolidados", len(data.equipment))
         st.metric("Equipos GPS únicos", len(data.gps))
         st.metric("Camiones fábrica GPS", int(data.diagnostics.get("gps_factory_trucks", 0)))

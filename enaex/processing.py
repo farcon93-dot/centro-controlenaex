@@ -81,16 +81,24 @@ OTHER_EQUIPMENT_LABEL = "Otro equipo"
 
 
 def equipment_category(value: Any) -> str:
-    """Clasifica el equipo para separar contrato de inventario operativo.
+    """Clasifica equipos usando SOLO el código/nombre del equipo.
 
-    Los contratos de flota consideran exclusivamente camiones fábrica AUGER y QUADRA.
-    Los polvorines se identifican por códigos PMO / PMOCAM y siguen visibles por faena,
-    pero nunca suman al cumplimiento contractual de camiones fábrica.
+    Regla contractual estricta:
+    - Camión fábrica: el identificador comienza por QUADRA o AUGER.
+    - Polvorín: el identificador comienza por PMO o PMOCAM.
+    - Todo lo demás (AFI, camionetas, auxiliares, etc.) es Otro equipo.
+
+    Esta función NO usa marca, tipo GPS ni ninguna otra columna para decidir el contrato.
     """
-    key = normalize_identifier(value)
-    if key.startswith("quadra") or key.startswith("auger"):
+    text = normalize_text(value)
+    if not text:
+        return OTHER_EQUIPMENT_LABEL
+
+    # Acepta formatos reales como "QUADRA-79 UB", "QUADRA 1003",
+    # "AUGER-168 AT Ex" y evita que "AFI 2815400" cuente por contrato.
+    if re.match(r"^(quadra|auger)(?:\b|[-_ ])", text):
         return FACTORY_TRUCK_LABEL
-    if key.startswith("pmocam") or key.startswith("pmo"):
+    if re.match(r"^(pmocam|pmo)(?:\b|[-_ ])", text):
         return POLVORIN_LABEL
     return OTHER_EQUIPMENT_LABEL
 
@@ -1322,14 +1330,22 @@ def build_rebalancing_recommendations(projection: pd.DataFrame) -> list[str]:
     return recommendations
 
 def build_contracts(gps: pd.DataFrame) -> pd.DataFrame:
-    """Calcula cumplimiento contractual usando SOLO camiones fábrica AUGER / QUADRA."""
-    if gps.empty:
+    """Calcula cumplimiento contractual contando EXCLUSIVAMENTE AUGER / QUADRA.
+
+    La clasificación se recalcula desde ``equipment`` cada vez para que una columna
+    ``equipment_category`` antigua o cacheada nunca pueda hacer que AFI/PMO sumen al contrato.
+    """
+    if gps.empty or "equipment" not in gps.columns:
         counts: dict[str, int] = {}
     else:
-        if "equipment_category" in gps.columns:
-            factory = gps[gps["equipment_category"] == FACTORY_TRUCK_LABEL]
+        factory_mask = gps["equipment"].map(is_factory_truck).fillna(False)
+        factory = gps.loc[factory_mask].copy()
+        # Protección adicional frente a duplicados inesperados de la API.
+        if "equipment_key" in factory.columns:
+            factory = factory.drop_duplicates(subset=["canonical_contract", "equipment_key"], keep="last")
         else:
-            factory = gps[gps["equipment"].map(is_factory_truck)]
+            factory["_contract_equipment_key"] = factory["equipment"].map(normalize_identifier)
+            factory = factory.drop_duplicates(subset=["canonical_contract", "_contract_equipment_key"], keep="last")
         counts = factory["canonical_contract"].value_counts().to_dict()
     rows: list[dict[str, Any]] = []
     for contract, target in CONTRACT_TARGETS.items():

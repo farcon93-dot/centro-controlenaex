@@ -510,3 +510,24 @@ def test_polvorin_is_visible_but_not_contractual() -> None:
     collahuasi = data.contracts[data.contracts["contract"] == "Collahuasi"].iloc[0]
     assert collahuasi["actual"] == 1
     assert data.diagnostics["gps_polvorines"] == 2
+
+
+def test_chuquicamata_sample_counts_three_quadra_and_excludes_afi() -> None:
+    gps = pd.DataFrame(
+        [
+            gps_row("QUADRA-79 UB", "Faena", 0, "Chuquicamata"),
+            gps_row("QUADRA-1003", "Faena", 1, "Chuquicamata"),
+            gps_row("QUADRA-147 AT", "Faena", 2, "Chuquicamata"),
+            gps_row("AFI 2815400", "Faena", 3, "Chuquicamata"),
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    chuqui = data.contracts[data.contracts["contract"] == "Chuquicamata"].iloc[0]
+    assert chuqui["actual"] == 3
+    assert chuqui["target"] == 2
+    assert chuqui["difference"] == 1
+    categories = dict(zip(data.gps["equipment"], data.gps["equipment_category"]))
+    assert categories["QUADRA-79 UB"] == "Camión fábrica"
+    assert categories["QUADRA-1003"] == "Camión fábrica"
+    assert categories["QUADRA-147 AT"] == "Camión fábrica"
+    assert categories["AFI 2815400"] == "Otro equipo"
