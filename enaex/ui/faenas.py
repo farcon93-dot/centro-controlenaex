@@ -6,6 +6,13 @@ import streamlit as st
 from enaex.configuration import CONTRACT_TARGETS
 from enaex.models import ApplicationData
 from enaex.normalize import format_date
+from enaex.processing import FACTORY_TRUCK_LABEL, POLVORIN_LABEL, OTHER_EQUIPMENT_LABEL, equipment_category
+
+
+def _category_series(frame: pd.DataFrame) -> pd.Series:
+    if "equipment_category" in frame.columns:
+        return frame["equipment_category"].fillna(OTHER_EQUIPMENT_LABEL)
+    return frame.get("equipment", pd.Series(index=frame.index, dtype="object")).map(equipment_category)
 
 
 def render_faenas_page(data: ApplicationData) -> None:
@@ -17,42 +24,57 @@ def render_faenas_page(data: ApplicationData) -> None:
         return
 
     gps_filtered = data.gps[data.gps["canonical_contract"] == selected].copy() if not data.gps.empty else pd.DataFrame()
-    actual = len(gps_filtered)
+    if not gps_filtered.empty:
+        gps_filtered["equipment_category"] = _category_series(gps_filtered)
+
+    factory = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(FACTORY_TRUCK_LABEL)] if not gps_filtered.empty else pd.DataFrame()
+    polvorines = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(POLVORIN_LABEL)] if not gps_filtered.empty else pd.DataFrame()
+    others = gps_filtered[gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")).eq(OTHER_EQUIPMENT_LABEL)] if not gps_filtered.empty else pd.DataFrame()
+
+    actual_contract = len(factory)
     target = CONTRACT_TARGETS.get(selected)
 
     st.subheader(f"Análisis de contrato: {selected}")
-    first, second, third = st.columns(3)
-    first.metric("Equipos GPS únicos", actual)
+    first, second, third, fourth = st.columns(4)
+    first.metric("Camiones fábrica (contrato)", actual_contract)
     second.metric("Objetivo contractual", target if target is not None else "Sin objetivo")
-    if target is None:
-        third.metric("Diferencia", "N/A")
-    else:
-        third.metric("Diferencia", actual - target)
-        if actual < target:
-            st.error(f"Faltan {target - actual} equipos para cumplir el objetivo.")
-        elif actual == target:
-            st.warning("El contrato está cumplido exactamente.")
+    third.metric("Diferencia", actual_contract - target if target is not None else "N/A")
+    fourth.metric("Polvorines PMO / PMOCAM", len(polvorines))
+
+    if target is not None:
+        if actual_contract < target:
+            st.error(f"Faltan {target - actual_contract} camiones fábrica AUGER/QUADRA para cumplir el objetivo.")
+        elif actual_contract == target:
+            st.warning("El contrato de camiones fábrica está cumplido exactamente.")
         else:
-            st.success(f"El contrato está {actual - target} equipos sobre el objetivo.")
+            st.success(f"El contrato tiene {actual_contract - target} camiones fábrica sobre el objetivo.")
+
+    if len(others):
+        st.caption(f"Además se detectan {len(others)} equipos de otros tipos. No se consideran en el objetivo contractual.")
 
     if gps_filtered.empty:
         st.info(f"No hay equipos GPS reportando en {selected}.")
         return
 
+    st.markdown("### Equipos reportados en la faena")
     display = pd.DataFrame(
         {
+            "Tipo": gps_filtered.get("equipment_category", pd.Series(index=gps_filtered.index, dtype="object")),
             "Equipo": gps_filtered.get("equipment", pd.Series(index=gps_filtered.index, dtype="object")),
             "Patente": gps_filtered.get("plate", pd.Series(index=gps_filtered.index, dtype="object")),
             "Marca": gps_filtered.get("brand", pd.Series(index=gps_filtered.index, dtype="object")),
             "Modelo": gps_filtered.get("model", pd.Series(index=gps_filtered.index, dtype="object")),
             "Horómetro": gps_filtered.get("hours", pd.Series(index=gps_filtered.index, dtype="object")),
             "Estado": gps_filtered.get("status", pd.Series(index=gps_filtered.index, dtype="object")),
+            "Lugar": gps_filtered.get("place", pd.Series(index=gps_filtered.index, dtype="object")),
             "Última actualización": gps_filtered.get(
                 "timestamp_parsed", pd.Series(index=gps_filtered.index, dtype="datetime64[ns]")
             ).map(format_date),
             "Faena reportada": gps_filtered.get("faena", pd.Series(index=gps_filtered.index, dtype="object")),
         }
     )
-    # Elimina columnas completamente vacías sin provocar KeyError.
     display = display.dropna(axis=1, how="all")
+    order = {FACTORY_TRUCK_LABEL: 0, POLVORIN_LABEL: 1, OTHER_EQUIPMENT_LABEL: 2}
+    display["_orden"] = display["Tipo"].map(order).fillna(9)
+    display = display.sort_values(["_orden", "Equipo"], na_position="last").drop(columns=["_orden"])
     st.dataframe(display.reset_index(drop=True), hide_index=True, use_container_width=True)

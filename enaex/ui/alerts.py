@@ -9,7 +9,7 @@ from enaex.ui.common import render_contract_card
 
 def render_alerts_page(data: ApplicationData) -> None:
     st.header("🚨 Panel de Alertas Tempranas")
-    st.subheader("⚖️ Estado de Cumplimiento de Contratos")
+    st.subheader("⚖️ Estado de Cumplimiento de Contratos — solo camiones fábrica AUGER / QUADRA")
 
     if data.contracts.empty:
         st.info("No hay datos GPS suficientes para calcular contratos.")

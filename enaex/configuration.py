@@ -44,7 +44,10 @@ WORKSHOP_CAPACITY = {
     "FULL RPM": 4,
 }
 
-GPS_TYPES = (27, 26, 24, 21, 23, 41)
+# Se amplía el barrido para incluir familias que no estaban en la lista original,
+# especialmente polvorines PMO / PMOCAM que suelen venir en tipos vecinos.
+# Mantiene 41 porque ya era utilizado por el sistema anterior.
+GPS_TYPES = tuple(range(20, 31)) + (41,)
 GPS_ZONES = tuple(range(1, 14))
 
 

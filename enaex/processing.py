@@ -73,6 +73,36 @@ def canonical_contract(value: Any) -> str:
 
 
 
+
+
+FACTORY_TRUCK_LABEL = "Camión fábrica"
+POLVORIN_LABEL = "Polvorín"
+OTHER_EQUIPMENT_LABEL = "Otro equipo"
+
+
+def equipment_category(value: Any) -> str:
+    """Clasifica el equipo para separar contrato de inventario operativo.
+
+    Los contratos de flota consideran exclusivamente camiones fábrica AUGER y QUADRA.
+    Los polvorines se identifican por códigos PMO / PMOCAM y siguen visibles por faena,
+    pero nunca suman al cumplimiento contractual de camiones fábrica.
+    """
+    key = normalize_identifier(value)
+    if key.startswith("quadra") or key.startswith("auger"):
+        return FACTORY_TRUCK_LABEL
+    if key.startswith("pmocam") or key.startswith("pmo"):
+        return POLVORIN_LABEL
+    return OTHER_EQUIPMENT_LABEL
+
+
+def is_factory_truck(value: Any) -> bool:
+    return equipment_category(value) == FACTORY_TRUCK_LABEL
+
+
+def is_polvorin(value: Any) -> bool:
+    return equipment_category(value) == POLVORIN_LABEL
+
+
 def parse_days_remaining(value: Any) -> int | None:
     """Extrae días restantes desde valores como 140, -5 o "🟢 31"."""
     if is_empty(value):
@@ -384,7 +414,9 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
             "gps_rows_unique": 0,
         }
     gps["canonical_contract"] = gps["faena"].map(canonical_contract)
+    gps["equipment_category"] = gps["equipment"].map(equipment_category)
 
+    category_counts = gps["equipment_category"].value_counts().to_dict()
     diagnostics = {
         "gps_column_mapping": mapping,
         "gps_column_candidates": {
@@ -394,6 +426,9 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
         "gps_rows_received": len(gps_rows),
         "gps_rows_unique": len(gps),
         "gps_numeric_status_values_rejected": rejected_numeric_status,
+        "gps_equipment_category_counts": category_counts,
+        "gps_factory_trucks": int(category_counts.get(FACTORY_TRUCK_LABEL, 0)),
+        "gps_polvorines": int(category_counts.get(POLVORIN_LABEL, 0)),
     }
     return gps.reset_index(drop=True), diagnostics
 
@@ -1287,7 +1322,15 @@ def build_rebalancing_recommendations(projection: pd.DataFrame) -> list[str]:
     return recommendations
 
 def build_contracts(gps: pd.DataFrame) -> pd.DataFrame:
-    counts = gps["canonical_contract"].value_counts().to_dict() if not gps.empty else {}
+    """Calcula cumplimiento contractual usando SOLO camiones fábrica AUGER / QUADRA."""
+    if gps.empty:
+        counts: dict[str, int] = {}
+    else:
+        if "equipment_category" in gps.columns:
+            factory = gps[gps["equipment_category"] == FACTORY_TRUCK_LABEL]
+        else:
+            factory = gps[gps["equipment"].map(is_factory_truck)]
+        counts = factory["canonical_contract"].value_counts().to_dict()
     rows: list[dict[str, Any]] = []
     for contract, target in CONTRACT_TARGETS.items():
         actual = int(counts.get(contract, 0))

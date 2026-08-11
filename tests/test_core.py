@@ -481,3 +481,32 @@ def test_movement_status_does_not_replace_current_api_status() -> None:
 
 def test_date_with_maintenance_cycle_in_parentheses() -> None:
     assert format_date("30-07-2026 (450)") == "30/07/2026"
+
+
+def test_contract_counts_only_factory_trucks() -> None:
+    gps = pd.DataFrame(
+        [
+            gps_row("Quadra-70", "Faena", 0, "Michilla"),
+            gps_row("Auger-165", "Faena", 1, "Michilla"),
+            gps_row("AFI 2817496", "Faena", 2, "Michilla"),
+            gps_row("PMO-101", "Faena", 3, "Michilla"),
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    michilla = data.contracts[data.contracts["contract"] == "Michilla"].iloc[0]
+    assert michilla["actual"] == 2
+
+
+def test_polvorin_is_visible_but_not_contractual() -> None:
+    gps = pd.DataFrame(
+        [
+            gps_row("PMOCAM-12", "Faena", 0, "Collahuasi"),
+            gps_row("PMO-22", "Faena", 1, "Collahuasi"),
+            gps_row("Quadra-1030", "Faena", 2, "Collahuasi"),
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    assert set(data.gps["equipment_category"].tolist()) == {"Polvorín", "Camión fábrica"}
+    collahuasi = data.contracts[data.contracts["contract"] == "Collahuasi"].iloc[0]
+    assert collahuasi["actual"] == 1
+    assert data.diagnostics["gps_polvorines"] == 2
