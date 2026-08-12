@@ -531,3 +531,21 @@ def test_chuquicamata_sample_counts_three_quadra_and_excludes_afi() -> None:
     assert categories["QUADRA-1003"] == "Camión fábrica"
     assert categories["QUADRA-147 AT"] == "Camión fábrica"
     assert categories["AFI 2815400"] == "Otro equipo"
+
+
+def test_antucoya_contract_counts_only_factory_trucks():
+    import pandas as pd
+    from enaex.processing import build_contracts
+    names = [
+        "QUADRA-80 UIB", "QUADRA-83 UIB", "AUGER-150", "AUGER-1002 AT",
+        "AFI 2817052", "AFI 2817053",
+    ]
+    gps = pd.DataFrame({
+        "equipment": names,
+        "equipment_key": names,
+        "canonical_contract": ["Antucoya"] * len(names),
+    })
+    row = build_contracts(gps).query("contract == 'Antucoya'").iloc[0]
+    assert int(row["actual"]) == 4
+    assert int(row["target"]) == 3
+    assert int(row["difference"]) == 1
