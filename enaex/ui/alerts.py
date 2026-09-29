@@ -16,6 +16,7 @@ from enaex.processing import (
     build_cross_source_discrepancies,
 )
 from enaex.ui.common import render_contract_card
+from enaex.normalize import clean_display
 
 
 CROSS_AI_RESULT_KEY = "enaex_cross_ai_result"
@@ -47,7 +48,16 @@ def _render_cross_audit(data: ApplicationData, settings: Settings, ai_model: str
         "no decide qué fuente es correcta ni inventa datos faltantes."
     )
 
-    discrepancies = build_cross_source_discrepancies(data.equipment)
+    try:
+        discrepancies = build_cross_source_discrepancies(data.equipment)
+    except Exception:
+        # La auditoría cruzada es complementaria: nunca debe derribar Alertas.
+        st.warning(
+            "La auditoría cruzada no pudo procesar uno de los registros recibidos. "
+            "El resto de la aplicación sigue operativo. Recarga los datos y vuelve a intentar."
+        )
+        return
+
     if discrepancies.empty:
         if data.diagnostics.get("gps_partial_snapshot"):
             st.warning(
@@ -83,23 +93,16 @@ def _render_cross_audit(data: ApplicationData, settings: Settings, ai_model: str
             "detail": "Detalle",
         }
     )
-    st.dataframe(
-        display[
-            [
-                "Equipo",
-                "Faena",
-                "Tipo",
-                "Sistema planificación",
-                "Excel semanal",
-                "Retorno sistema",
-                "Retorno/entrega Excel",
-                "Diferencia días",
-                "Detalle",
-            ]
-        ],
-        hide_index=True,
-        use_container_width=True,
-    )
+    visible_columns = [
+        "Equipo", "Faena", "Tipo", "Sistema planificación", "Excel semanal",
+        "Retorno sistema", "Retorno/entrega Excel", "Diferencia días", "Detalle",
+    ]
+    display = display.reindex(columns=visible_columns).copy()
+    # Streamlit/Arrow puede fallar con columnas object que mezclan pd.NA e int.
+    # Convertimos todo lo visible a texto seguro; los cálculos siguen usando el DF original.
+    for column in visible_columns:
+        display[column] = display[column].map(lambda value: clean_display(value, default=""))
+    st.dataframe(display, hide_index=True, use_container_width=True)
 
     st.markdown("#### Análisis con Gemini")
     if not settings.gemini_api_key:
