@@ -1776,6 +1776,139 @@ def search_equipment_ids(
     return [best_id]
 
 
+
+def build_cross_source_discrepancies(
+    equipment: pd.DataFrame,
+    today: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Detecta diferencias objetivas entre sistema de planificación y Excel semanal.
+
+    El sistema/API representa el estado actual. El Excel se interpreta como la
+    planificación semanal (Mov. equipos) y, cuando corresponde, como un estado
+    En proceso con taller informado. La función solo genera alertas cuando ambas
+    fuentes entregan datos comparables; los N/A no se tratan como discrepancia.
+    """
+    columns = [
+        "equipment", "faena", "issue_type", "system_place", "excel_place",
+        "system_return_date", "excel_return_date", "date_difference_days", "detail",
+    ]
+    if equipment.empty:
+        return pd.DataFrame(columns=columns)
+
+    today = (today or pd.Timestamp.now()).normalize()
+    issues: list[dict[str, Any]] = []
+
+    def valid_text(value: Any) -> str:
+        text = clean_display(value, default="").strip()
+        return "" if normalize_text(text) in {"", "n/a", "na", "none", "sin informacion", "sin información"} else text
+
+    def system_location(value: Any) -> tuple[str, str]:
+        text = valid_text(value)
+        if not text:
+            return "unknown", "N/A"
+        normalized = normalize_text(text)
+        if normalized in {"faena", "en faena", "operacion", "operativo"} or normalized.startswith("faena "):
+            return "faena", "Faena"
+        bucket = classify_current_workshop(text)
+        if bucket is not None:
+            return "workshop", text
+        return "unknown", text
+
+    def excel_location(row: pd.Series) -> tuple[str, str, str]:
+        start = parse_date(row.get("start_date"))
+        end = parse_date(row.get("end_date"))
+        planned_workshop = valid_text(row.get("planned_workshop"))
+        latest_workshop = valid_text(row.get("workshop"))
+        planning_status = normalize_text(row.get("planning_status"))
+        detail = normalize_text(row.get("status_detail"))
+
+        # Movimiento actualmente vigente: la hoja Mov. equipos espera el camión en taller.
+        if start is not None and start <= today and (end is None or today <= end) and planned_workshop:
+            return "workshop", planned_workshop, "Mov. equipos vigente"
+
+        # Estado actual del Excel que explícitamente indica un trabajo en proceso con taller.
+        in_process = any(token in planning_status for token in ("en proceso", "en taller"))
+        mentions_workshop = "taller" in detail
+        if latest_workshop and (in_process or mentions_workshop):
+            return "workshop", latest_workshop, "Estado de equipos / En proceso"
+
+        # Si la bajada aún no comienza o la entrega ya ocurrió, el plan espera el equipo en faena.
+        if start is not None and today < start:
+            return "faena", "Faena", "Bajada futura en Mov. equipos"
+        if end is not None and today > end:
+            return "faena", "Faena", "Entrega a faena ya programada"
+
+        return "unknown", "N/A", "Sin ubicación Excel comparable"
+
+    for _, row in equipment.iterrows():
+        equipment_name = valid_text(row.get("equipment")) or "Equipo sin nombre"
+        faena = valid_text(row.get("gps_faena")) or valid_text(row.get("planned_faena")) or "N/A"
+
+        sys_kind, sys_label = system_location(row.get("gps_place"))
+        excel_kind, excel_label, excel_basis = excel_location(row)
+
+        location_detail = ""
+        if sys_kind != "unknown" and excel_kind != "unknown":
+            if sys_kind != excel_kind:
+                location_detail = (
+                    f"Sistema de planificación indica {sys_label}; Excel espera {excel_label} "
+                    f"({excel_basis})."
+                )
+            elif sys_kind == "workshop":
+                system_workshop = normalize_workshop(sys_label) or normalize_text(sys_label)
+                excel_workshop = normalize_workshop(excel_label) or normalize_text(excel_label)
+                if system_workshop and excel_workshop and system_workshop != excel_workshop:
+                    location_detail = (
+                        f"Sistema de planificación indica taller {sys_label}; Excel indica taller {excel_label} "
+                        f"({excel_basis})."
+                    )
+
+        if location_detail:
+            issues.append(
+                {
+                    "equipment": equipment_name,
+                    "faena": faena,
+                    "issue_type": "Ubicación",
+                    "system_place": sys_label,
+                    "excel_place": excel_label,
+                    "system_return_date": "N/A",
+                    "excel_return_date": "N/A",
+                    "date_difference_days": pd.NA,
+                    "detail": location_detail,
+                }
+            )
+
+        system_return = parse_date(row.get("return_operation_date"))
+        excel_return = parse_date(row.get("end_date"))
+        if system_return is not None and excel_return is not None:
+            difference = int((system_return.normalize() - excel_return.normalize()).days)
+            if difference != 0:
+                issues.append(
+                    {
+                        "equipment": equipment_name,
+                        "faena": faena,
+                        "issue_type": "Fecha retorno",
+                        "system_place": sys_label if sys_kind != "unknown" else "N/A",
+                        "excel_place": excel_label if excel_kind != "unknown" else "N/A",
+                        "system_return_date": format_date(system_return),
+                        "excel_return_date": format_date(excel_return),
+                        "date_difference_days": difference,
+                        "detail": (
+                            f"Fecha retorno del sistema: {format_date(system_return)}; "
+                            f"fecha entrega/subida del Excel: {format_date(excel_return)}; "
+                            f"diferencia: {abs(difference)} día(s)."
+                        ),
+                    }
+                )
+
+    result = pd.DataFrame(issues, columns=columns)
+    if result.empty:
+        return result
+    priority = result["issue_type"].map({"Ubicación": 0, "Fecha retorno": 1}).fillna(9)
+    result = result.assign(_priority=priority)
+    return result.sort_values(["_priority", "faena", "equipment"]).drop(columns="_priority").reset_index(drop=True)
+
+
 def build_application_data(
     excel_raw: pd.DataFrame,
     gps_raw: pd.DataFrame,

@@ -44,13 +44,13 @@ def main() -> None:
         st.rerun()
 
     render_sidebar(data, ai_model, ai_error, refresh)
-    st.sidebar.caption("Entrypoint activo: app_v2.py · Build CERTIFICACIONES-V2")
+    st.sidebar.caption("Entrypoint activo: app_v2.py · Build IA-CROSS-V1")
 
     tab_alerts, tab_equipment, tab_movements, tab_faenas = st.tabs(
         ["🚨 Alertas", "🔍 Buscar Equipo", "📅 Movimientos de Equipos", "📍 Ver por Faena"]
     )
     with tab_alerts:
-        render_alerts_page(data)
+        render_alerts_page(data, settings, ai_model)
     with tab_equipment:
         render_equipment_page(data, settings, ai_model)
     with tab_movements:

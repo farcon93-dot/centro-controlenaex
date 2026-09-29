@@ -13,8 +13,8 @@ from enaex.normalize import format_date
 
 PREFERRED_MODELS = (
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
 )
 
 
@@ -27,36 +27,120 @@ def get_gemini_client(api_key: str) -> genai.Client | None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_gemini_model(api_key: str, requested_model: str = "") -> tuple[str | None, str | None]:
+    """Resuelve un modelo de texto sin depender de una sola versión del SDK.
+
+    Algunas versiones de google-genai exponen ``supported_actions`` de forma
+    distinta. La implementación anterior podía concluir erróneamente que una
+    clave no tenía modelos compatibles. Aquí validamos primero por ``models.get``
+    y usamos ``models.list`` solo como descubrimiento adicional.
+    """
     if not api_key:
         return None, "Falta GEMINI_API_KEY. La aplicación funciona sin IA."
+
+    requested_short = requested_model.removeprefix("models/").strip()
+    client = None
     try:
         client = genai.Client(api_key=api_key)
+
+        # Si el usuario configuró un modelo, validarlo directamente. Esto evita
+        # falsos negativos cuando models.list cambia entre versiones del SDK.
+        if requested_short:
+            try:
+                client.models.get(model=requested_short)
+                return requested_short, None
+            except Exception:
+                pass
+
+        # Probar modelos Flash conocidos y económicos antes de depender del listado.
+        for candidate in PREFERRED_MODELS:
+            try:
+                client.models.get(model=candidate)
+                return candidate, None
+            except Exception:
+                continue
+
+        # Último recurso: listar modelos y aceptar Gemini de texto aunque el SDK
+        # no exponga supported_actions / supported_generation_methods igual.
         available: list[str] = []
         for model in client.models.list(config={"page_size": 100}):
             name = str(getattr(model, "name", ""))
             short_name = name.removeprefix("models/")
-            actions = [str(action).lower() for action in (getattr(model, "supported_actions", None) or [])]
-            supports_generation = not actions or any("generate" in action for action in actions)
-            if "gemini" in short_name.lower() and supports_generation and "embedding" not in short_name.lower():
-                available.append(short_name)
-        client.close()
-
-        if requested_model:
-            requested_short = requested_model.removeprefix("models/")
-            if requested_short in available:
-                return requested_short, None
-            return None, f"El modelo configurado '{requested_model}' no está disponible para esta API key."
+            lowered = short_name.lower()
+            if not short_name or "gemini" not in lowered:
+                continue
+            if any(token in lowered for token in ("embedding", "imagen", "image", "tts", "live")):
+                continue
+            available.append(short_name)
 
         for preferred in PREFERRED_MODELS:
             if preferred in available:
                 return preferred, None
-        flash_models = sorted(model for model in available if "flash" in model.lower() and "image" not in model.lower())
+        flash_models = sorted(model for model in available if "flash" in model.lower())
         if flash_models:
             return flash_models[-1], None
-        return (available[0], None) if available else (None, "La API key no tiene modelos Gemini de texto disponibles.")
+        if available:
+            return available[0], None
+        return None, "La clave Gemini respondió, pero no expuso un modelo de texto utilizable."
     except Exception as exc:
         return None, friendly_ai_error(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
+
+
+def _generation_candidates(model_name: str) -> list[str]:
+    candidates: list[str] = []
+    for candidate in (model_name, *PREFERRED_MODELS):
+        short = str(candidate or "").removeprefix("models/").strip()
+        if short and short not in candidates:
+            candidates.append(short)
+    return candidates
+
+
+def _generate_text(
+    api_key: str,
+    model_name: str,
+    prompt: str,
+    *,
+    system_instruction: str,
+    max_output_tokens: int,
+) -> tuple[str | None, str | None]:
+    """Genera texto y prueba modelos de respaldo solo ante error de modelo.
+
+    No reintenta frente a cuota 429 ni claves inválidas para evitar consumir más
+    solicitudes de las necesarias.
+    """
+    client = get_gemini_client(api_key)
+    if client is None:
+        return None, "No fue posible crear el cliente de IA."
+
+    last_exc: Exception | None = None
+    for candidate in _generation_candidates(model_name):
+        try:
+            response = client.models.generate_content(
+                model=candidate,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_output_tokens,
+                    system_instruction=system_instruction,
+                ),
+            )
+            text = (response.text or "").strip()
+            return (text or None), (None if text else "Gemini respondió sin texto.")
+        except Exception as exc:
+            last_exc = exc
+            lowered = str(exc).lower()
+            # Solo pasar al siguiente modelo si el problema es de modelo/no encontrado.
+            if "404" in lowered or "not found" in lowered or "model" in lowered and "unsupported" in lowered:
+                continue
+            return None, friendly_ai_error(exc)
+
+    return None, friendly_ai_error(last_exc or RuntimeError("No hay modelos Gemini disponibles"))
 
 def _record_for_ai(row: pd.Series) -> dict[str, Any]:
     return {
@@ -116,25 +200,13 @@ Datos ya mostrados en la aplicación:
 {json.dumps(payload, ensure_ascii=False, default=str)}
 """.strip()
 
-    try:
-        client = get_gemini_client(api_key)
-        if client is None:
-            return None, "No fue posible crear el cliente de IA."
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=450,
-                system_instruction=(
-                    "Eres un auditor técnico. Sé breve, conservador y no inventes información."
-                ),
-            ),
-        )
-        text = (response.text or "").strip()
-        return (text or None), (None if text else "Gemini respondió sin texto.")
-    except Exception as exc:
-        return None, friendly_ai_error(exc)
+    return _generate_text(
+        api_key,
+        model_name,
+        prompt,
+        system_instruction="Eres un auditor técnico. Sé breve, conservador y no inventes información.",
+        max_output_tokens=450,
+    )
 
 
 
@@ -172,25 +244,63 @@ Datos:
 {json.dumps(payload, ensure_ascii=False, default=str)}
 """.strip()
 
-    try:
-        client = get_gemini_client(api_key)
-        if client is None:
-            return None, "No fue posible crear el cliente de IA."
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=500,
-                system_instruction=(
-                    "Eres un analista de mantenimiento. Resume solo hechos presentes en el historial."
-                ),
-            ),
-        )
-        text = (response.text or "").strip()
-        return (text or None), (None if text else "Gemini respondió sin texto.")
-    except Exception as exc:
-        return None, friendly_ai_error(exc)
+    return _generate_text(
+        api_key,
+        model_name,
+        prompt,
+        system_instruction="Eres un analista de mantenimiento. Resume solo hechos presentes en el historial.",
+        max_output_tokens=500,
+    )
+
+
+def analyze_cross_source_discrepancies(
+    api_key: str,
+    model_name: str,
+    discrepancies: pd.DataFrame,
+) -> tuple[str | None, str | None]:
+    """Prioriza inconsistencias ya calculadas entre planificación/API y Excel."""
+    if not api_key:
+        return None, "La IA está desactivada porque falta GEMINI_API_KEY."
+    if not model_name:
+        return None, "No existe un modelo Gemini disponible."
+    if discrepancies.empty:
+        return None, "No existen discrepancias para analizar."
+
+    safe_columns = [
+        column for column in (
+            "equipment", "faena", "issue_type", "system_place", "excel_place",
+            "system_return_date", "excel_return_date", "date_difference_days", "detail",
+        ) if column in discrepancies.columns
+    ]
+    payload = discrepancies[safe_columns].head(80).to_dict(orient="records")
+    prompt = f"""
+Actúa como auditor de mantenimiento y consistencia de datos.
+La aplicación YA calculó las discrepancias entre el sistema de planificación y el Excel semanal.
+Tu tarea es interpretarlas y priorizarlas, no volver a calcularlas.
+
+Reglas obligatorias:
+- No inventes fechas, ubicaciones, talleres, estados ni causas.
+- Si Sistema = Faena y Excel = Taller, indícalo como posible desalineación operativa.
+- Si Sistema = Taller y Excel = Faena, indícalo también como posible desalineación.
+- Si las fechas de retorno/entrega son distintas, menciona la diferencia de días entregada por la app.
+- Agrupa casos repetidos cuando sea útil.
+- Prioriza primero ubicaciones contradictorias y después diferencias de fecha.
+- Entrega entre 3 y 12 viñetas, concretas y accionables.
+- Recomienda verificar el dato en origen; no decidas cuál fuente es correcta si la evidencia no lo permite.
+
+Discrepancias detectadas:
+{json.dumps(payload, ensure_ascii=False, default=str)}
+""".strip()
+
+    return _generate_text(
+        api_key,
+        model_name,
+        prompt,
+        system_instruction=(
+            "Eres un auditor técnico conservador. Solo interpretas discrepancias previamente calculadas y nunca inventas datos."
+        ),
+        max_output_tokens=800,
+    )
 
 def friendly_ai_error(exc: Exception) -> str:
     text = str(exc)
@@ -286,22 +396,10 @@ Movimientos de la semana, provenientes únicamente de la hoja Mov. equipos:
 {json.dumps(movement_payload, ensure_ascii=False, default=str)}
 """.strip()
 
-    try:
-        client = get_gemini_client(api_key)
-        if client is None:
-            return None, "No fue posible crear el cliente de IA."
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=550,
-                system_instruction=(
-                    "Eres un planificador técnico conservador. No alteres cifras ni inventes datos."
-                ),
-            ),
-        )
-        text = (response.text or "").strip()
-        return (text or None), (None if text else "Gemini respondió sin texto.")
-    except Exception as exc:
-        return None, friendly_ai_error(exc)
+    return _generate_text(
+        api_key,
+        model_name,
+        prompt,
+        system_instruction="Eres un planificador técnico conservador. No alteres cifras ni inventes datos.",
+        max_output_tokens=550,
+    )

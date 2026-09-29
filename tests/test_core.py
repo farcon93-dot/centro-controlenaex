@@ -759,3 +759,118 @@ def test_critical_certifications_omit_missing_and_green_documents() -> None:
     assert row["document"] == "DGMN"
     assert int(row["days"]) == 0
     assert row["status"] == "🔴 Vence hoy"
+
+
+
+def test_cross_audit_flags_faena_vs_active_workshop() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame(
+        [
+            {
+                "equipment": "QUADRA-1",
+                "gps_faena": "Andina",
+                "gps_place": "Faena",
+                "planned_workshop": "SKC Calama",
+                "workshop": "SKC Calama",
+                "planning_status": "En proceso",
+                "status_detail": "Equipo en taller",
+                "start_date": pd.Timestamp("2026-09-20"),
+                "end_date": pd.Timestamp("2026-10-05"),
+                "return_operation_date": pd.NaT,
+            }
+        ]
+    )
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-29"))
+    location = result[result["issue_type"].eq("Ubicación")]
+    assert len(location) == 1
+    assert location.iloc[0]["system_place"] == "Faena"
+    assert location.iloc[0]["excel_place"] == "SKC Calama"
+
+
+def test_cross_audit_flags_workshop_vs_completed_excel_plan() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame(
+        [
+            {
+                "equipment": "QUADRA-2",
+                "gps_faena": "Centinela",
+                "gps_place": "Río Loa",
+                "planned_workshop": "Río Loa",
+                "workshop": "Río Loa",
+                "planning_status": "Listo",
+                "status_detail": "",
+                "start_date": pd.Timestamp("2026-09-10"),
+                "end_date": pd.Timestamp("2026-09-25"),
+                "return_operation_date": pd.NaT,
+            }
+        ]
+    )
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-29"))
+    location = result[result["issue_type"].eq("Ubicación")]
+    assert len(location) == 1
+    assert location.iloc[0]["system_place"] == "Río Loa"
+    assert location.iloc[0]["excel_place"] == "Faena"
+
+
+def test_cross_audit_flags_return_date_difference() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame(
+        [
+            {
+                "equipment": "QUADRA-3",
+                "gps_faena": "Lomas Bayas",
+                "gps_place": "Faena",
+                "planned_workshop": "SKC Calama",
+                "workshop": "N/A",
+                "planning_status": "Pendiente",
+                "status_detail": "",
+                "start_date": pd.Timestamp("2026-10-01"),
+                "end_date": pd.Timestamp("2026-10-10"),
+                "return_operation_date": pd.Timestamp("2026-10-12"),
+            }
+        ]
+    )
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-29"))
+    dates = result[result["issue_type"].eq("Fecha retorno")]
+    assert len(dates) == 1
+    assert int(dates.iloc[0]["date_difference_days"]) == 2
+    assert dates.iloc[0]["system_return_date"] == "12/10/2026"
+    assert dates.iloc[0]["excel_return_date"] == "10/10/2026"
+
+
+def test_cross_audit_ignores_unknowns_and_equal_values() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame(
+        [
+            {
+                "equipment": "QUADRA-4",
+                "gps_faena": "Andina",
+                "gps_place": "Faena",
+                "planned_workshop": "SKC Calama",
+                "workshop": "N/A",
+                "planning_status": "Pendiente",
+                "status_detail": "",
+                "start_date": pd.Timestamp("2026-10-10"),
+                "end_date": pd.Timestamp("2026-10-20"),
+                "return_operation_date": pd.Timestamp("2026-10-20"),
+            },
+            {
+                "equipment": "QUADRA-5",
+                "gps_faena": "Andina",
+                "gps_place": "N/A",
+                "planned_workshop": "N/A",
+                "workshop": "N/A",
+                "planning_status": "N/A",
+                "status_detail": "",
+                "start_date": pd.NaT,
+                "end_date": pd.NaT,
+                "return_operation_date": pd.NaT,
+            },
+        ]
+    )
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-29"))
+    assert result.empty
