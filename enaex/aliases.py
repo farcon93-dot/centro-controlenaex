@@ -261,7 +261,10 @@ CONTRACT_ALIASES: dict[str, tuple[str, ...]] = {
     "Chuquicamata": ("chuquicamata", "chuqui"),
     "Lomas Bayas": ("lomas bayas",),
     "Los Colorados": ("los colorados", "colorados"),
-    "Salvador": ("el salvador", "salvador"),
+    "Salvador": (
+        "el salvador", "salvador", "division salvador", "división salvador",
+        "rajo inca", "proyecto rajo inca", "codelco rajo inca", "codelco salvador",
+    ),
     "Teniente": ("el teniente", "teniente"),
     "Zaldivar": ("zaldivar", "zaldívar"),
     "Cerro Negro": ("cerro negro",),

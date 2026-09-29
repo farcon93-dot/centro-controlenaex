@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from enaex.models import ApplicationData
-from enaex.processing import build_contracts
+from enaex.processing import build_contracts, build_planning_critical_certifications
 from enaex.ui.common import render_contract_card
 
 
@@ -13,11 +13,9 @@ def render_alerts_page(data: ApplicationData) -> None:
     st.subheader("⚖️ Estado de Cumplimiento de Contratos — SOLO AUGER / QUADRA")
     st.caption("AFI, PMO/PMOCAM, camionetas y cualquier otro equipo quedan excluidos del cálculo contractual.")
 
-    # Recalcula en la propia pantalla desde los nombres actuales de la API.
-    # Así una tabla data.contracts cacheada de una versión anterior no puede inflar el conteo.
     contracts = build_contracts(data.gps)
     if contracts.empty:
-        st.info("No hay datos GPS suficientes para calcular contratos.")
+        st.info("No hay datos del sistema de planificación suficientes para calcular contratos.")
     else:
         columns = st.columns(6)
         for index, row in contracts.iterrows():
@@ -28,32 +26,27 @@ def render_alerts_page(data: ApplicationData) -> None:
 
     st.divider()
     st.subheader("⚠️ Certificaciones críticas")
-    if data.certifications.empty:
-        st.info("No hay equipos del Excel para revisar certificaciones.")
+    st.caption(
+        "Se muestran exclusivamente certificaciones que el sistema de planificación tiene en amarillo o rojo "
+        "(30 días o menos, o vencidas). Incluye todos los tipos de equipos: camiones fábrica, polvorines, "
+        "auxiliares Enaex y equipos en arriendo."
+    )
+
+    critical = build_planning_critical_certifications(data.gps)
+    if critical.empty:
+        st.success("No se detectaron certificaciones amarillas o rojas en el sistema de planificación.")
         return
 
-    critical = data.certifications[data.certifications["status"].isin(["Vencida", "Vence pronto", "Fecha inválida"])].copy()
-    if critical.empty:
-        st.success("No se detectaron certificaciones vencidas ni próximas a vencer en 30 días.")
-    else:
-        display = critical[["equipment", "document", "expiration_text", "days", "status"]].rename(
-            columns={
-                "equipment": "Equipo",
-                "document": "Documento",
-                "expiration_text": "Vencimiento",
-                "days": "Días restantes",
-                "status": "Estado",
-            }
-        )
-        st.dataframe(display, hide_index=True, use_container_width=True)
-
-    missing = data.certifications[data.certifications["status"] == "Sin fecha"]
-    with st.expander(f"Documentos sin fecha registrada ({len(missing)})"):
-        if missing.empty:
-            st.write("No hay documentos sin fecha.")
-        else:
-            st.dataframe(
-                missing[["equipment", "document"]].rename(columns={"equipment": "Equipo", "document": "Documento"}),
-                hide_index=True,
-                use_container_width=True,
-            )
+    display = critical[[
+        "equipment", "faena", "document", "expiration_text", "days", "status"
+    ]].rename(
+        columns={
+            "equipment": "Equipo",
+            "faena": "Faena",
+            "document": "Documento",
+            "expiration_text": "Vencimiento",
+            "days": "Días restantes",
+            "status": "Estado",
+        }
+    )
+    st.dataframe(display, hide_index=True, use_container_width=True)

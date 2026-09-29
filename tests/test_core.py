@@ -549,3 +549,44 @@ def test_antucoya_contract_counts_only_factory_trucks():
     assert int(row["actual"]) == 4
     assert int(row["target"]) == 3
     assert int(row["difference"]) == 1
+
+
+def test_rajo_inca_is_canonicalized_as_salvador() -> None:
+    assert canonical_contract("Rajo Inca") == "Salvador"
+    assert canonical_contract("Codelco Rajo Inca") == "Salvador"
+    assert canonical_contract("División Salvador") == "Salvador"
+
+
+def test_salvador_contract_includes_rajo_inca_factory_trucks() -> None:
+    gps = pd.DataFrame(
+        [
+            gps_row("QUADRA-1200", "Faena", 0, "Rajo Inca"),
+            gps_row("AUGER-177", "Faena", 1, "Salvador"),
+            gps_row("AFI 999999", "Faena", 2, "Rajo Inca"),
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    salvador = data.contracts[data.contracts["contract"] == "Salvador"].iloc[0]
+    assert int(salvador["actual"]) == 2
+
+
+def test_critical_certifications_use_planning_api_and_all_equipment_types() -> None:
+    from enaex.processing import build_planning_critical_certifications
+
+    today = pd.Timestamp("2026-09-28")
+    gps_raw = pd.DataFrame(
+        [
+            {"Equipo": "QUADRA-1001", "Faena": "Centinela", "D. RT": 20, "D. Sernageomin": 45, "D. DGMN": -2},
+            {"Equipo": "PMOCAM-12", "Faena": "Collahuasi", "D. RT": 10, "D. Sernageomin": 90, "D. DGMN": 90},
+            {"Equipo": "AUX-ENAEX-7", "Faena": "Spence", "D. RT": 5, "D. Sernageomin": 80, "D. DGMN": 80},
+            {"Equipo": "ARRIENDO-55", "Faena": "Andina", "D. RT": 29, "D. Sernageomin": 100, "D. DGMN": 100},
+            {"Equipo": "AFI 123", "Faena": "Antucoya", "D. RT": None, "D. Sernageomin": None, "D. DGMN": None},
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=today)
+    assert set(critical["equipment"]) == {"QUADRA-1001", "PMOCAM-12", "AUX-ENAEX-7", "ARRIENDO-55"}
+    assert "AFI 123" not in set(critical["equipment"])
+    assert set(critical["status"]) == {"🟡 Vence pronto", "🔴 Vencida"}
+    # Solo amarillo/rojo: el Sernageomin verde de 45 días no aparece.
+    assert not ((critical["equipment"] == "QUADRA-1001") & (critical["document"] == "Sernageomin")).any()

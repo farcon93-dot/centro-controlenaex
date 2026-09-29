@@ -758,6 +758,84 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
         ).reset_index(drop=True)
     return equipment, aliases_by_entity
 
+def build_planning_critical_certifications(
+    gps: pd.DataFrame,
+    today: pd.Timestamp | None = None,
+    warning_days: int = 30,
+) -> pd.DataFrame:
+    """Devuelve SOLO certificaciones amarillas/rojas del sistema de planificación.
+
+    Esta vista se construye directamente desde la API de planificación ya
+    canonicalizada (``gps``), sin depender del Excel ni de la categoría del
+    equipo. Por lo tanto incluye camiones fábrica, polvorines, auxiliares Enaex,
+    equipos en arriendo y cualquier otro equipo que reporte RT/Sernageomin/DGMN.
+
+    Convención observada en el sistema:
+    - rojo: vencido (días < 0)
+    - amarillo: vence dentro de ``warning_days`` (0..30 por defecto)
+    - verde: más de ``warning_days``; no se muestra en alertas críticas
+
+    Registros sin valor/fecha válida se omiten, porque no representan una alerta
+    amarilla o roja del sistema de planificación.
+    """
+    columns = [
+        "equipment", "document", "expiration", "expiration_text",
+        "days", "status", "priority", "faena", "place",
+    ]
+    if gps.empty:
+        return pd.DataFrame(columns=columns)
+
+    today = (today or pd.Timestamp.now()).normalize()
+    docs = (
+        ("Revisión Técnica", "revision_tecnica_date", "revision_tecnica_days"),
+        ("Sernageomin", "sernageomin_date", "sernageomin_days"),
+        ("DGMN", "dgmn_date", "dgmn_days"),
+    )
+
+    rows: list[dict[str, Any]] = []
+    for _, row in gps.iterrows():
+        equipment_name = clean_display(row.get("equipment"), default="")
+        if not equipment_name:
+            continue
+        for document, date_field, days_field in docs:
+            expiration, days, _source = expiration_from_api(
+                row.get(date_field), row.get(days_field), today=today
+            )
+            if days is None:
+                continue
+            if days < 0:
+                status = "🔴 Vencida"
+                priority = 0
+            elif days <= warning_days:
+                status = "🟡 Vence pronto"
+                priority = 1
+            else:
+                continue
+
+            rows.append(
+                {
+                    "equipment": equipment_name,
+                    "document": document,
+                    "expiration": expiration,
+                    "expiration_text": format_date(expiration),
+                    "days": int(days),
+                    "status": status,
+                    "priority": priority,
+                    "faena": clean_display(row.get("faena"), default="N/A"),
+                    "place": clean_display(row.get("place"), default="N/A"),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(rows)
+    return result.sort_values(
+        ["priority", "days", "equipment", "document"],
+        ascending=[True, True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
 def build_certifications(equipment: pd.DataFrame, today: pd.Timestamp | None = None) -> pd.DataFrame:
     if equipment.empty:
         return pd.DataFrame()
