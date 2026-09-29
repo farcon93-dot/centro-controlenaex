@@ -943,3 +943,47 @@ def test_api_variants_of_same_truck_are_merged_field_by_field() -> None:
     assert row["gps_condition"] == "Operativo"
     assert row["control_system"] == "E-BLAST"
 
+
+
+def test_blank_api_place_defaults_to_faena_when_faena_is_known() -> None:
+    gps = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1019 AT Ex",
+            "Faena": "Andina",
+            "Lugar": None,
+            "Estado": "OK",
+        },
+        {
+            "Equipo": "QUADRA-75 AT Ex",
+            "Faena": "Andina",
+            "Lugar": "FullRPM",
+            "Estado": "PREVENTIVO",
+        },
+    ])
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    by_equipment = data.gps.set_index("equipment")
+    assert by_equipment.loc["QUADRA-1019 AT Ex", "place"] == "Faena"
+    assert by_equipment.loc["QUADRA-75 AT Ex", "place"] == "FullRPM"
+
+
+def test_blank_api_place_propagates_to_equipment_card_as_faena() -> None:
+    excel = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1019",
+            "_source_file": "Excel_1",
+            "_source_sheet": "Maestro",
+            "_source_row": 2,
+            "_global_order": 0,
+        }
+    ])
+    gps = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1019 AT Ex",
+            "Faena": "Andina",
+            "Lugar": None,
+            "Estado": "OK",
+        }
+    ])
+    data = build_application_data(excel, gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["gps_place"] == "Faena"

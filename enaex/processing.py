@@ -648,6 +648,14 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
             "gps_column_candidates": details,
             "gps_rows_unique": 0,
         }
+    # Regla operacional validada en terreno: cuando la API reporta una faena válida
+    # pero deja Lugar vacío/N/A, el equipo se considera físicamente en Faena.
+    # Si Lugar contiene un valor explícito (SKC, INDUMAR, FullRPM, etc.) se respeta.
+    if "place" in gps.columns and "faena" in gps.columns:
+        faena_valid = gps["faena"].map(lambda value: not is_empty(value))
+        place_empty = gps["place"].map(is_empty)
+        gps.loc[faena_valid & place_empty, "place"] = "Faena"
+
     gps["canonical_contract"] = gps["faena"].map(canonical_contract)
     gps["equipment_category"] = gps["equipment"].map(equipment_category)
 

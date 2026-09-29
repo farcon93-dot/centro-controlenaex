@@ -93,8 +93,11 @@ def render_faenas_page(data: ApplicationData) -> None:
             "Modelo": gps_filtered.get("model", pd.Series(index=gps_filtered.index, dtype="object")),
             "Horómetro": gps_filtered.get("hours", pd.Series(index=gps_filtered.index, dtype="object")),
             "Estado": gps_filtered.get("status", pd.Series(index=gps_filtered.index, dtype="object")),
-            "Lugar": gps_filtered.get("place", pd.Series(index=gps_filtered.index, dtype="object")).map(
-                lambda value: clean_display(value, default="N/A")
+            "Lugar": gps_filtered.apply(
+                lambda row: clean_display(row.get("place"), default="Faena")
+                if clean_display(row.get("faena"), default="")
+                else clean_display(row.get("place"), default="N/A"),
+                axis=1,
             ),
             "Fecha retorno a operación": gps_filtered.get(
                 "return_operation_date", pd.Series(index=gps_filtered.index, dtype="object")
