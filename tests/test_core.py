@@ -687,3 +687,75 @@ def test_gps_loader_retries_timeout_and_recovers(monkeypatch) -> None:
     assert diagnostics["gps_requests_failed"] == 0
     assert diagnostics["gps_requests_recovered"] >= 1
     assert errors == []
+
+
+def test_certificate_aliases_can_merge_multiple_api_schemas() -> None:
+    from enaex.processing import build_critical_certifications_all_equipment
+
+    gps_raw = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-1001",
+                "Faena": "Centinela",
+                "D. RT": 20,
+                "D. Sernageomin": 45,
+                "D. DGMN": 90,
+                "dias_rt": None,
+            },
+            {
+                "Equipo": "AFI 55555",
+                "Faena": "Andina",
+                "D. RT": None,
+                "dias_rt": 8,
+                "dias_sngm": -2,
+                "dias_dgmn": 100,
+            },
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    by_name = data.gps.set_index("equipment")
+    assert int(by_name.loc["QUADRA-1001", "revision_tecnica_days"]) == 20
+    assert int(by_name.loc["AFI 55555", "revision_tecnica_days"]) == 8
+    assert int(by_name.loc["AFI 55555", "sernageomin_days"]) == -2
+
+    critical = build_critical_certifications_all_equipment(data.equipment, today=pd.Timestamp("2026-09-29"))
+    afi = critical[critical["equipment"].eq("AFI 55555")]
+    assert set(afi["document"]) == {"Revisión Técnica", "Sernageomin"}
+    assert set(afi["equipment_type"]) == {"Equipo en arriendo"}
+
+
+def test_critical_certifications_differentiate_all_requested_equipment_types() -> None:
+    from enaex.processing import build_critical_certifications_all_equipment
+
+    gps_raw = pd.DataFrame(
+        [
+            {"Equipo": "AUGER-1001", "Faena": "Centinela", "D. RT": 15},
+            {"Equipo": "AFI 5718695_E-PMO", "Faena": "Collahuasi", "D. Sernageomin": -1},
+            {"Equipo": "C GRUA - TZWS-80", "Faena": "Andina", "D. DGMN": 25},
+            {"Equipo": "AFI 2817052", "Faena": "Antucoya", "D. RT": 5},
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_critical_certifications_all_equipment(data.equipment, today=pd.Timestamp("2026-09-29"))
+    type_by_equipment = dict(zip(critical["equipment"], critical["equipment_type"]))
+    assert type_by_equipment["AUGER-1001"] == "Camión fábrica"
+    assert type_by_equipment["AFI 5718695_E-PMO"] == "Polvorín"
+    assert type_by_equipment["C GRUA - TZWS-80"] == "Auxiliar Enaex"
+    assert type_by_equipment["AFI 2817052"] == "Equipo en arriendo"
+
+
+def test_critical_certifications_omit_missing_and_green_documents() -> None:
+    from enaex.processing import build_critical_certifications_all_equipment
+
+    gps_raw = pd.DataFrame(
+        [
+            {"Equipo": "QUADRA-1", "Faena": "Andina", "D. RT": 31, "D. Sernageomin": None, "D. DGMN": 0},
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_critical_certifications_all_equipment(data.equipment, today=pd.Timestamp("2026-09-29"))
+    assert len(critical) == 1
+    row = critical.iloc[0]
+    assert row["document"] == "DGMN"
+    assert int(row["days"]) == 0
+    assert row["status"] == "🔴 Vence hoy"

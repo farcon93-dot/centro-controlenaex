@@ -111,6 +111,33 @@ def is_polvorin(value: Any) -> bool:
     return equipment_category(value) == POLVORIN_LABEL
 
 
+CERT_FACTORY_LABEL = "Camión fábrica"
+CERT_POLVORIN_LABEL = "Polvorín"
+CERT_AUXILIARY_LABEL = "Auxiliar Enaex"
+CERT_RENTAL_LABEL = "Equipo en arriendo"
+
+
+def certification_equipment_category(value: Any) -> str:
+    """Clasificación operativa para la vista de certificaciones.
+
+    Los prefijos AUGER/QUADRA y PMO/PMOCAM son reglas de negocio conocidas.
+    Los AFI se muestran como equipos en arriendo; códigos explícitos de arriendo
+    o rental también. El resto de activos no contractuales se agrupa como
+    auxiliares Enaex para no perderlos de la revisión documental.
+    """
+    text = normalize_text(value)
+    compact = normalize_identifier(value)
+    if re.match(r"^(quadra|auger)", compact):
+        return CERT_FACTORY_LABEL
+    # PMO puede venir embebido en identificadores de arriendo, por ejemplo
+    # "AFI 5718695_E-PMO"; sigue siendo un polvorín para esta vista.
+    if re.search(r"(^|\s)pmo(?:cam)?(?:\s|$)", text) or compact.startswith(("pmo", "pmocam")):
+        return CERT_POLVORIN_LABEL
+    if compact.startswith("afi") or any(token in text for token in ("arriendo", "rental", "rentado", "rentada")):
+        return CERT_RENTAL_LABEL
+    return CERT_AUXILIARY_LABEL
+
+
 def parse_days_remaining(value: Any) -> int | None:
     """Extrae días restantes desde valores como 140, -5 o "🟢 31"."""
     if is_empty(value):
@@ -440,6 +467,50 @@ def _fill_from_raw_candidates(
     return result
 
 
+def _infer_certificate_columns(gps_raw: pd.DataFrame, document: str) -> tuple[list[str], list[str]]:
+    """Encuentra columnas de días/fecha de RT, Sernageomin o DGMN por esquema.
+
+    La API no mantiene siempre el mismo nombre de llave entre tipos de equipo.
+    Esta detección usa el encabezado y valida el contenido, evitando depender de
+    una única columna global para toda la flota.
+    """
+    doc = normalize_text(document)
+    if doc == "rt":
+        def matches(name: str) -> bool:
+            return bool(re.search(r"(^|\s)rt($|\s)", name)) or "revision tecnica" in name
+    elif doc == "sernageomin":
+        def matches(name: str) -> bool:
+            return "sernageomin" in name or bool(re.search(r"(^|\s)sngm($|\s)", name))
+    else:
+        def matches(name: str) -> bool:
+            return "dgmn" in name
+
+    day_candidates: list[tuple[float, str]] = []
+    date_candidates: list[tuple[float, str]] = []
+    for column in gps_raw.columns:
+        if str(column).startswith("_gps_"):
+            continue
+        header = normalize_text(column)
+        if not header or not matches(header):
+            continue
+        values = gps_raw[column].dropna().head(500)
+        if values.empty:
+            continue
+        parsed_days = values.map(parse_days_remaining)
+        parsed_dates = values.map(parse_date)
+        day_ratio = float(parsed_days.notna().mean())
+        date_ratio = float(parsed_dates.notna().mean())
+        header_days = any(token in header for token in ("dias", "dia", "d rt", "d sngm", "d sernageomin", "d dgmn"))
+        header_date = any(token in header for token in ("fecha", "vencimiento", "vigencia"))
+        if day_ratio >= 0.35 and not header_date:
+            day_candidates.append((day_ratio + (0.5 if header_days else 0.0), str(column)))
+        if date_ratio >= 0.35 or header_date:
+            date_candidates.append((date_ratio + (0.5 if header_date else 0.0), str(column)))
+    day_candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    date_candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    return [c for _, c in day_candidates[:8]], [c for _, c in date_candidates[:8]]
+
+
 def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     if gps_raw.empty:
         return pd.DataFrame(), {"gps_column_mapping": {}, "gps_column_candidates": {}}
@@ -451,6 +522,21 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
     # la lógica del resto de campos.
     inferred_place_columns = _infer_place_columns(gps_raw)
     inferred_return_columns = _infer_return_date_columns(gps_raw)
+    inferred_cert_columns: dict[str, list[str]] = {}
+    for doc_key, day_field, date_field in (
+        ("rt", "revision_tecnica_days", "revision_tecnica_date"),
+        ("sernageomin", "sernageomin_days", "sernageomin_date"),
+        ("dgmn", "dgmn_days", "dgmn_date"),
+    ):
+        day_columns, date_columns = _infer_certificate_columns(gps_raw, doc_key)
+        inferred_cert_columns[day_field] = day_columns
+        inferred_cert_columns[date_field] = date_columns
+        for column in day_columns:
+            if column not in mapping.get(day_field, []):
+                mapping.setdefault(day_field, []).append(column)
+        for column in date_columns:
+            if column not in mapping.get(date_field, []):
+                mapping.setdefault(date_field, []).append(column)
     for column in inferred_place_columns:
         if column not in mapping.get("place", []):
             mapping.setdefault("place", []).append(column)
@@ -557,6 +643,7 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
         "gps_polvorines": int(category_counts.get(POLVORIN_LABEL, 0)),
         "gps_inferred_place_columns": inferred_place_columns,
         "gps_inferred_return_operation_columns": inferred_return_columns,
+        "gps_inferred_certificate_columns": inferred_cert_columns,
     }
     return gps.reset_index(drop=True), diagnostics
 
@@ -954,6 +1041,78 @@ def build_planning_critical_certifications(
         ascending=[True, True, True, True],
         na_position="last",
     ).reset_index(drop=True)
+
+
+def build_critical_certifications_all_equipment(
+    equipment: pd.DataFrame,
+    today: pd.Timestamp | None = None,
+    warning_days: int = 30,
+) -> pd.DataFrame:
+    """Alertas RT/Sernageomin/DGMN amarillas o rojas de toda la flota.
+
+    Usa la ficha consolidada: primero aprovecha los días/fechas entregados por la
+    API y, cuando ese endpoint no trae el campo, conserva la fecha válida del
+    historial de planificación. Nunca incluye documentos sin dato válido.
+    """
+    columns = [
+        "equipment_type", "equipment", "faena", "document",
+        "expiration", "expiration_text", "days", "status", "priority",
+    ]
+    if equipment.empty:
+        return pd.DataFrame(columns=columns)
+    today = (today or pd.Timestamp.now()).normalize()
+    docs = (
+        ("Revisión Técnica", "revision_tecnica", "revision_tecnica_days"),
+        ("Sernageomin", "sernageomin", "sernageomin_days"),
+        ("DGMN", "dgmn", "dgmn_days"),
+    )
+    rows: list[dict[str, Any]] = []
+    for _, row in equipment.iterrows():
+        name = clean_display(row.get("equipment"), default="")
+        if not name:
+            continue
+        faena = clean_display(row.get("gps_faena"), default="")
+        if not faena or normalize_text(faena) in {"no reporta gps", "n a"}:
+            faena = clean_display(row.get("planned_faena"), default="N/A")
+        for document, date_field, days_field in docs:
+            days = parse_days_remaining(row.get(days_field))
+            expiration = parse_date(row.get(date_field))
+            if days is None and expiration is not None:
+                days = int((expiration - today).days)
+            if days is None:
+                continue
+            if expiration is None:
+                expiration = today + pd.Timedelta(days=days)
+            if days <= 0:
+                status = "🔴 Vencida" if days < 0 else "🔴 Vence hoy"
+                priority = 0
+            elif days <= warning_days:
+                status = "🟡 Vence pronto"
+                priority = 1
+            else:
+                continue
+            rows.append({
+                "equipment_type": certification_equipment_category(name),
+                "equipment": name,
+                "faena": faena or "N/A",
+                "document": document,
+                "expiration": expiration,
+                "expiration_text": format_date(expiration),
+                "days": int(days),
+                "status": status,
+                "priority": priority,
+            })
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(rows)
+    # Una sola alerta por equipo/documento. Si por integración llegaran dos,
+    # conserva la más crítica (menor cantidad de días).
+    result = result.sort_values(
+        ["priority", "days", "equipment", "document"],
+        ascending=[True, True, True, True],
+        na_position="last",
+    ).drop_duplicates(["equipment", "document"], keep="first")
+    return result.reset_index(drop=True)
 
 
 def build_certifications(equipment: pd.DataFrame, today: pd.Timestamp | None = None) -> pd.DataFrame:

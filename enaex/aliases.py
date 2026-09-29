@@ -234,10 +234,13 @@ GPS_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "return_operation_date": ("retorno",),
 }
 
+# Algunos endpoints de la API usan nombres distintos para las certificaciones.
+# No se fuerzan a una sola columna: se pueden combinar D. RT, dias_rt, etc.
+# por fila. Estado/condición y otras variables operativas sí conservan una
+# única fuente prioritaria para evitar cruces con columnas parecidas.
 GPS_SINGLE_SOURCE_FIELDS = {
     "condition", "status", "return_operation_date", "days_out_service",
-    "next_maintenance_date", "revision_tecnica_date", "sernageomin_date", "dgmn_date",
-    "revision_tecnica_days", "sernageomin_days", "dgmn_days",
+    "next_maintenance_date",
 }
 
 FIELD_MIN_SCORE: dict[str, float] = {
