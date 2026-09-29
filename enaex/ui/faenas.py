@@ -26,6 +26,11 @@ def _classify(frame: pd.DataFrame) -> pd.Series:
 def render_faenas_page(data: ApplicationData) -> None:
     st.header("📍 Vista Global de Faenas")
     st.caption("Contrato = SOLO camiones fábrica cuyo código comienza por AUGER o QUADRA. AFI, PMO/PMOCAM y otros equipos no suman al objetivo.")
+    if data.diagnostics.get("gps_partial_snapshot"):
+        st.warning(
+            "⚠️ La API de planificación quedó parcialmente incompleta incluso después de los reintentos. "
+            "Los conteos por faena pueden ser inferiores a los reales hasta que respondan todos los endpoints."
+        )
 
     active = sorted(data.gps["canonical_contract"].dropna().astype(str).unique().tolist()) if not data.gps.empty else []
     options = sorted(set(CONTRACT_TARGETS) | set(active))

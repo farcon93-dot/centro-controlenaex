@@ -63,11 +63,15 @@ def _format_mapping(mapping: dict[str, list[str]]) -> pd.DataFrame:
 def render_sidebar(data: ApplicationData, ai_model: str | None, ai_error: str | None, refresh_callback: Any) -> None:
     with st.sidebar:
         st.header("Estado del sistema")
-        st.caption("Versión 2026.09.29.1 · LUGAR + RETORNO OPERACIÓN")
+        st.caption("Versión 2026.09.29.2 · API ROBUSTA + LUGAR/RETORNO")
         st.metric("Equipos consolidados", len(data.equipment))
         st.metric("Equipos GPS únicos", len(data.gps))
         st.metric("Camiones fábrica GPS", int(data.diagnostics.get("gps_factory_trucks", 0)))
         st.metric("Polvorines GPS", int(data.diagnostics.get("gps_polvorines", 0)))
+        recovered = int(data.diagnostics.get("gps_requests_recovered", 0) or 0)
+        failed = int(data.diagnostics.get("gps_requests_failed", 0) or 0)
+        if recovered or failed:
+            st.caption(f"API planificación: {recovered} consultas recuperadas · {failed} fallidas")
         st.metric("Filas útiles del Excel", len(data.history))
         st.caption(f"Última carga: {data.loaded_at.strftime('%d/%m/%Y %H:%M:%S')}")
 

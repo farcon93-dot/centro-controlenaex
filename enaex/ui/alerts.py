@@ -12,6 +12,11 @@ def render_alerts_page(data: ApplicationData) -> None:
     st.header("🚨 Panel de Alertas Tempranas")
     st.subheader("⚖️ Estado de Cumplimiento de Contratos — SOLO AUGER / QUADRA")
     st.caption("AFI, PMO/PMOCAM, camionetas y cualquier otro equipo quedan excluidos del cálculo contractual.")
+    if data.diagnostics.get("gps_partial_snapshot"):
+        st.warning(
+            "⚠️ El sistema de planificación no respondió a todos los endpoints después de los reintentos. "
+            "Mientras exista este aviso, un contrato puede verse con menos equipos de los reales."
+        )
 
     contracts = build_contracts(data.gps)
     if contracts.empty:

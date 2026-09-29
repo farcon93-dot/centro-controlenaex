@@ -105,10 +105,13 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "place": (
         "lugar", "nombre lugar", "nombre_lugar", "lugar nombre", "lugar_nombre",
-        "lugar actual", "lugar equipo", "ubicacion", "ubicación",
-        "ubicacion actual", "ubicación actual", "ubicacion nombre", "ubicación nombre",
-        "ubicacion_nombre", "ubicacion fisica", "ubicación física",
-        "taller actual", "localizacion", "localización", "localizacion nombre",
+        "lugar actual", "lugar equipo", "lugar_actual", "lugar_equipo",
+        "ubicacion", "ubicación", "ubicacion actual", "ubicación actual",
+        "ubicacion nombre", "ubicación nombre", "ubicacion_nombre",
+        "ubicacion fisica", "ubicación física", "ubicacion_fisica",
+        "taller actual", "taller_actual", "localizacion", "localización",
+        "localizacion nombre", "localizacion_nombre", "location", "place",
+        "estado lugar", "estado_lugar", "sector actual", "sector_actual",
     ),
     "condition": (
         "condicion", "condición", "nombre condicion", "nombre condición",
@@ -135,7 +138,14 @@ GPS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "return_operation_date": (
         "fecha retorno operacion", "fecha retorno operación", "fecha_retorno_operacion",
+        "fecha retorno a operacion", "fecha retorno a operación", "fecha_retorno_a_operacion",
+        "fecha de retorno operacion", "fecha de retorno operación",
+        "fecha estimada retorno operacion", "fecha estimada retorno operación",
+        "fecha_estimada_retorno_operacion", "fecha retorno", "fecha_retorno",
         "retorno operacion", "retorno operación", "retorno_operacion",
+        "retorno a operacion", "retorno a operación", "f retorno", "f. retorno",
+        "fecha ret operacion", "fecha ret operación", "fecha_ret_operacion",
+        "fecha regreso operacion", "fecha regreso operación", "fecha_regreso_operacion",
     ),
     "days_out_service": (
         "dias fuera de servicio", "días fuera de servicio", "dias fs", "días fs",

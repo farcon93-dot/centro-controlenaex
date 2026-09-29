@@ -348,11 +348,116 @@ def _pick_gps_group_value(group: pd.DataFrame, field: str) -> Any:
     return pd.NA
 
 
+_PLACE_VALUE_TOKENS = (
+    "faena", "indumar", "full rpm", "fullrpm", "skc", "rio loa", "río loa",
+    "alto hospicio", "antofagasta", "calama", "copiapo", "copiapó", "santiago",
+    "grow", "salfa", "kaufmann", "taller", "mantenimiento", "preparacion",
+    "preparación", "patio", "bodega", "servicio tecnico", "servicio técnico",
+)
+
+
+def _infer_place_columns(gps_raw: pd.DataFrame) -> list[str]:
+    """Detecta columnas de Lugar aunque el backend cambie el nombre técnico de la llave."""
+    candidates: list[tuple[int, float, str]] = []
+    forbidden_header_tokens = (
+        "faena", "contrato", "equipo", "nombre", "marca", "modelo", "estado",
+        "condicion", "condición", "fecha", "retorno", "mantencion", "mantención",
+        "sernageomin", "dgmn", "revision", "revisión", "horas", "horometro", "horómetro",
+    )
+    for column in gps_raw.columns:
+        name = normalize_text(column)
+        if str(column).startswith("_gps_") or not name:
+            continue
+        strong_header = any(token in name for token in (
+            "lugar", "ubicacion", "localizacion", "taller", "location", "place", "sector actual"
+        ))
+        if not strong_header and any(token in name for token in forbidden_header_tokens):
+            continue
+        values = gps_raw[column].dropna().astype(str).head(500)
+        if values.empty:
+            continue
+        normalized_values = [normalize_text(value) for value in values if normalize_text(value)]
+        if not normalized_values:
+            continue
+        place_hits = sum(
+            any(token in value for token in _PLACE_VALUE_TOKENS)
+            for value in normalized_values
+        )
+        ratio = place_hits / max(len(normalized_values), 1)
+        # Un encabezado fuerte basta con algunos valores reconocibles; para un encabezado
+        # desconocido exigimos que la gran mayoría parezcan lugares.
+        if strong_header and (place_hits > 0 or ratio >= 0.10):
+            candidates.append((2, ratio, str(column)))
+        elif ratio >= 0.60 and place_hits >= 2:
+            candidates.append((1, ratio, str(column)))
+    candidates.sort(key=lambda item: (-item[0], -item[1], len(item[2])))
+    return [column for _, _, column in candidates]
+
+
+def _infer_return_date_columns(gps_raw: pd.DataFrame) -> list[str]:
+    """Detecta la fecha de retorno a operación incluso con nombres de llave abreviados."""
+    candidates: list[tuple[int, float, str]] = []
+    for column in gps_raw.columns:
+        name = normalize_text(column)
+        if str(column).startswith("_gps_") or not name:
+            continue
+        header_score = 0
+        if "retorno" in name or "regreso" in name:
+            header_score += 3
+        if "operacion" in name:
+            header_score += 2
+        if "fecha" in name or re.search(r"(^| )f($| )", name):
+            header_score += 1
+        if "mantencion" in name or "mantenimiento" in name:
+            header_score -= 4
+        if header_score < 2:
+            continue
+        values = gps_raw[column].dropna().head(500)
+        if values.empty:
+            continue
+        valid_dates = sum(parse_date(value) is not None for value in values)
+        ratio = valid_dates / max(len(values), 1)
+        if valid_dates > 0:
+            candidates.append((header_score, ratio, str(column)))
+    candidates.sort(key=lambda item: (-item[0], -item[1], len(item[2])))
+    return [column for _, _, column in candidates]
+
+
+def _fill_from_raw_candidates(
+    result: pd.Series,
+    gps_raw: pd.DataFrame,
+    field: str,
+    candidates: list[str],
+) -> pd.Series:
+    for column in candidates:
+        if column not in gps_raw.columns:
+            continue
+        values = gps_raw[column]
+        valid = values.map(lambda value: _valid_gps_field_value(field, value))
+        fill_mask = result.map(is_empty) & valid
+        if fill_mask.any():
+            result.loc[fill_mask] = values.loc[fill_mask]
+    return result
+
+
 def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     if gps_raw.empty:
         return pd.DataFrame(), {"gps_column_mapping": {}, "gps_column_candidates": {}}
 
     mapping, details = match_columns(gps_raw.columns, GPS_FIELD_ALIASES, threshold=80.0)
+
+    # Fallbacks de esquema: el backend ha usado distintas llaves para Lugar y
+    # Fecha Retorno Operación. Se detectan por encabezado + contenido, sin alterar
+    # la lógica del resto de campos.
+    inferred_place_columns = _infer_place_columns(gps_raw)
+    inferred_return_columns = _infer_return_date_columns(gps_raw)
+    for column in inferred_place_columns:
+        if column not in mapping.get("place", []):
+            mapping.setdefault("place", []).append(column)
+    for column in inferred_return_columns:
+        if column not in mapping.get("return_operation_date", []):
+            mapping.setdefault("return_operation_date", []).append(column)
+
     gps_rows = pd.DataFrame(index=gps_raw.index)
     for field in GPS_CANONICAL_FIELDS:
         columns = mapping.get(field, [])
@@ -450,6 +555,8 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
         "gps_equipment_category_counts": category_counts,
         "gps_factory_trucks": int(category_counts.get(FACTORY_TRUCK_LABEL, 0)),
         "gps_polvorines": int(category_counts.get(POLVORIN_LABEL, 0)),
+        "gps_inferred_place_columns": inferred_place_columns,
+        "gps_inferred_return_operation_columns": inferred_return_columns,
     }
     return gps.reset_index(drop=True), diagnostics
 

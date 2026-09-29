@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 from io import BytesIO
 import re
+import time
 from typing import Any, Iterable
 
 import pandas as pd
@@ -207,57 +208,111 @@ def load_gps_source(
     timeout: int = 6,
     workers: int = 16,
 ) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
+    """Descarga la API de planificación con recuperación de endpoints intermitentes.
+
+    El servidor puede responder lentamente cuando se consultan muchos tipo/zona en paralelo.
+    Antes la aplicación aceptaba la foto parcial si un endpoint hacía timeout; eso podía
+    dejar una faena (p. ej. Collahuasi) sin sus AUGER/QUADRA. Ahora se hace:
+      1) primera pasada paralela con concurrencia moderada;
+      2) reintentos por endpoint con timeouts crecientes;
+      3) una pasada final de recuperación con muy baja concurrencia.
+    Solo se informa como fallo lo que no respondió después de todos los intentos.
+    """
+    endpoints = [(gps_type, zone) for gps_type in types for zone in zones]
     diagnostics: dict[str, Any] = {
-        "gps_requests_total": len(types) * len(zones),
+        "gps_requests_total": len(endpoints),
         "gps_requests_ok": 0,
         "gps_requests_failed": 0,
+        "gps_requests_recovered": 0,
+        "gps_retry_attempts": 0,
     }
     errors: list[str] = []
     if not api_key:
         return pd.DataFrame(), diagnostics, ["GPS: falta GPS_API_KEY en .streamlit/secrets.toml."]
 
-    def fetch(endpoint: tuple[int, int]) -> tuple[int, int, list[dict[str, Any]], str | None]:
-        gps_type, zone = endpoint
-        url = f"{base_url}/{gps_type}/{zone}"
-        try:
-            response = requests.get(
-                url,
-                params={"key": api_key},
-                timeout=timeout,
-                headers={"User-Agent": USER_AGENT},
-            )
-            if response.status_code != 200:
-                return gps_type, zone, [], f"HTTP {response.status_code}"
-            records = _unpack_json_payload(response.json())
-            for order, record in enumerate(records):
-                record["_gps_type"] = gps_type
-                record["_gps_zone"] = zone
-                record["_gps_response_order"] = order
-            return gps_type, zone, records, None
-        except Exception as exc:
-            return gps_type, zone, [], str(exc)
+    # No sobrecargar el servidor aunque el secret antiguo tenga GPS_WORKERS=16.
+    primary_workers = max(1, min(int(workers or 1), 8))
+    recovery_workers = max(1, min(2, primary_workers))
+    base_timeout = max(6, int(timeout or 6))
 
-    endpoints = [(gps_type, zone) for gps_type in types for zone in zones]
+    def request_once(gps_type: int, zone: int, request_timeout: int):
+        url = f"{base_url}/{gps_type}/{zone}"
+        response = requests.get(
+            url,
+            params={"key": api_key},
+            timeout=request_timeout,
+            headers={"User-Agent": USER_AGENT, "Connection": "close"},
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        records = _unpack_json_payload(response.json())
+        for order, record in enumerate(records):
+            record["_gps_type"] = gps_type
+            record["_gps_zone"] = zone
+            record["_gps_response_order"] = order
+        return records
+
+    def fetch(endpoint: tuple[int, int], attempts: int = 2, slow: bool = False):
+        gps_type, zone = endpoint
+        last_error = "Error desconocido"
+        for attempt in range(attempts):
+            request_timeout = base_timeout if attempt == 0 and not slow else max(12, base_timeout * (attempt + 2))
+            try:
+                payload = request_once(gps_type, zone, request_timeout)
+                return gps_type, zone, payload, None, attempt
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt + 1 < attempts:
+                    time.sleep(0.20 * (attempt + 1))
+        return gps_type, zone, [], last_error, attempts - 1
+
     records: list[dict[str, Any]] = []
-    failure_examples: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(fetch, endpoint) for endpoint in endpoints]
-        for future in concurrent.futures.as_completed(futures):
-            gps_type, zone, payload, error = future.result()
+    failed: dict[tuple[int, int], str] = {}
+
+    # Primera pasada: hasta 2 intentos por endpoint, pero con concurrencia acotada.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=primary_workers) as executor:
+        future_map = {executor.submit(fetch, endpoint, 2, False): endpoint for endpoint in endpoints}
+        for future in concurrent.futures.as_completed(future_map):
+            gps_type, zone, payload, error, retry_count = future.result()
+            diagnostics["gps_retry_attempts"] += int(retry_count)
             if error:
-                diagnostics["gps_requests_failed"] += 1
-                if len(failure_examples) < 5:
-                    failure_examples.append(f"tipo {gps_type}, zona {zone}: {error}")
+                failed[(gps_type, zone)] = error
             else:
                 diagnostics["gps_requests_ok"] += 1
+                if retry_count:
+                    diagnostics["gps_requests_recovered"] += 1
                 records.extend(payload)
 
-    if failure_examples:
+    # Segunda pasada solo para los que fallaron. Timeout más largo y 1-2 workers.
+    if failed:
+        to_recover = list(failed)
+        failed_final: dict[tuple[int, int], str] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=recovery_workers) as executor:
+            future_map = {executor.submit(fetch, endpoint, 3, True): endpoint for endpoint in to_recover}
+            for future in concurrent.futures.as_completed(future_map):
+                gps_type, zone, payload, error, retry_count = future.result()
+                diagnostics["gps_retry_attempts"] += int(retry_count + 1)
+                if error:
+                    failed_final[(gps_type, zone)] = error
+                else:
+                    diagnostics["gps_requests_ok"] += 1
+                    diagnostics["gps_requests_recovered"] += 1
+                    records.extend(payload)
+        failed = failed_final
+
+    diagnostics["gps_requests_failed"] = len(failed)
+    diagnostics["gps_partial_snapshot"] = bool(failed)
+
+    if failed:
+        examples = [f"tipo {t}, zona {z}: {err}" for (t, z), err in list(failed.items())[:8]]
         errors.append(
-            "GPS: algunas consultas fallaron (la app usará las que sí respondieron): "
-            + " | ".join(failure_examples)
+            f"GPS: {len(failed)} de {len(endpoints)} consultas no respondieron después de reintentos. "
+            "Los conteos de faena pueden quedar incompletos mientras persista esta falla: "
+            + " | ".join(examples)
         )
+
     frame = pd.DataFrame(records)
     diagnostics["gps_rows_raw"] = len(frame)
     diagnostics["gps_columns_raw"] = len(frame.columns)
     return frame, diagnostics, errors
+

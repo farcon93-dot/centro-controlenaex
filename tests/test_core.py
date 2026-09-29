@@ -619,3 +619,71 @@ def test_gps_place_falls_back_to_nombre_lugar_when_lugar_is_empty() -> None:
     assert by_equipment.loc["QUADRA-88 AT Ex", "place"] == "INDUMAR"
     assert format_date(by_equipment.loc["QUADRA-1052 MT EX", "return_operation_date"]) == "02/10/2026"
     assert format_date(by_equipment.loc["QUADRA-88 AT Ex", "return_operation_date"]) == "01/10/2026"
+
+
+def test_place_schema_fallback_detects_unknown_backend_key() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-1019 AT Ex",
+                "Faena": "Andina",
+                "ubicacion_operativa_actual": "Faena",
+                "Estado": "ALERTA 1",
+            },
+            {
+                "Equipo": "QUADRA-75 AT Ex",
+                "Faena": "Andina",
+                "ubicacion_operativa_actual": "FullRPM",
+                "Estado": "PREVENTIVO",
+            },
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    by_equipment = data.gps.set_index("equipment")
+    assert by_equipment.loc["QUADRA-1019 AT Ex", "place"] == "Faena"
+    assert by_equipment.loc["QUADRA-75 AT Ex", "place"] == "FullRPM"
+
+
+def test_return_operation_schema_fallback_detects_abbreviated_key() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-74 AT Ex",
+                "Faena": "Andina",
+                "Lugar": "Faena",
+                "fecha_estimada_retorno_operacion": "30-11-2026",
+                "Estado": "CATASTROFICO",
+            }
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    row = data.gps.iloc[0]
+    assert format_date(row["return_operation_date"]) == "30/11/2026"
+
+
+def test_gps_loader_retries_timeout_and_recovers(monkeypatch) -> None:
+    import requests
+    from enaex.data_sources import load_gps_source
+
+    calls = {"count": 0}
+
+    class Response:
+        status_code = 200
+        def json(self):
+            return [{"Equipo": "QUADRA-1", "Faena": "Collahuasi", "Lugar": "Faena"}]
+
+    def fake_get(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            raise requests.exceptions.ConnectTimeout("timeout de prueba")
+        return Response()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    frame, diagnostics, errors = load_gps_source(
+        "https://example.test/api/dashboard/estado", "key", (21,), (1,), timeout=6, workers=1
+    )
+    assert len(frame) == 1
+    assert frame.iloc[0]["Equipo"] == "QUADRA-1"
+    assert diagnostics["gps_requests_failed"] == 0
+    assert diagnostics["gps_requests_recovered"] >= 1
+    assert errors == []
