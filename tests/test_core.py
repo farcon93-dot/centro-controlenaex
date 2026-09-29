@@ -874,3 +874,72 @@ def test_cross_audit_ignores_unknowns_and_equal_values() -> None:
     )
     result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-29"))
     assert result.empty
+
+
+def test_excel_api_match_ignores_common_equipment_suffixes() -> None:
+    excel = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1060",
+            "Patente": "WVJH57",
+            "_source_file": "Excel_1",
+            "_source_sheet": "Maestro",
+            "_source_row": 2,
+            "_global_order": 0,
+        }
+    ])
+    gps = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1060 AT Ex",
+            "Faena": "Centinela",
+            "Lugar": "Faena",
+            "Condicion": "Operativo",
+            "Estado": "OK",
+            "Hrs/Kms desde ultimo preventivo": 510,
+            "Fecha Retorno Operacion": "02-10-2026",
+            "_gps_response_order": 0,
+        }
+    ])
+    data = build_application_data(excel, gps, settings())
+    assert len(data.equipment) == 1
+    row = data.equipment.iloc[0]
+    assert row["gps_faena"] == "Centinela"
+    assert row["gps_place"] == "Faena"
+    assert row["gps_condition"] == "Operativo"
+    assert row["gps_state"] == "OK"
+    assert str(row["gps_hours"]) == "510"
+    assert pd.Timestamp(row["return_operation_date"]) == pd.Timestamp("2026-10-02")
+
+
+def test_api_variants_of_same_truck_are_merged_field_by_field() -> None:
+    excel = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1060",
+            "_source_file": "Excel_1",
+            "_source_sheet": "Maestro",
+            "_source_row": 2,
+            "_global_order": 0,
+        }
+    ])
+    gps = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-1060 AT Ex",
+            "Faena": "Centinela",
+            "Lugar": "Faena",
+            "_gps_response_order": 0,
+        },
+        {
+            "Equipo": "QUADRA 1060",
+            "Estado": "OK",
+            "Condicion": "Operativo",
+            "Sistema Control": "E-BLAST",
+            "_gps_response_order": 1,
+        },
+    ])
+    data = build_application_data(excel, gps, settings())
+    row = data.equipment.iloc[0]
+    assert row["gps_faena"] == "Centinela"
+    assert row["gps_place"] == "Faena"
+    assert row["gps_state"] == "OK"
+    assert row["gps_condition"] == "Operativo"
+    assert row["control_system"] == "E-BLAST"
+

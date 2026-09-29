@@ -14,7 +14,6 @@ from enaex.normalize import format_date
 PREFERRED_MODELS = (
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 )
@@ -29,68 +28,19 @@ def get_gemini_client(api_key: str) -> genai.Client | None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_gemini_model(api_key: str, requested_model: str = "") -> tuple[str | None, str | None]:
-    """Resuelve un modelo de texto sin depender de una sola versión del SDK.
+    """Selecciona el modelo sin bloquear la app por una validación previa frágil.
 
-    Algunas versiones de google-genai exponen ``supported_actions`` de forma
-    distinta. La implementación anterior podía concluir erróneamente que una
-    clave no tenía modelos compatibles. Aquí validamos primero por ``models.get``
-    y usamos ``models.list`` solo como descubrimiento adicional.
+    La disponibilidad real se valida al generar contenido. Esto evita falsos
+    negativos de ``models.get/list`` entre versiones del SDK o proyectos nuevos.
     """
     if not api_key:
         return None, "Falta GEMINI_API_KEY. La aplicación funciona sin IA."
 
-    requested_short = requested_model.removeprefix("models/").strip()
-    client = None
-    try:
-        client = genai.Client(api_key=api_key)
-
-        # Si el usuario configuró un modelo, validarlo directamente. Esto evita
-        # falsos negativos cuando models.list cambia entre versiones del SDK.
-        if requested_short:
-            try:
-                client.models.get(model=requested_short)
-                return requested_short, None
-            except Exception:
-                pass
-
-        # Probar modelos Flash conocidos y económicos antes de depender del listado.
-        for candidate in PREFERRED_MODELS:
-            try:
-                client.models.get(model=candidate)
-                return candidate, None
-            except Exception:
-                continue
-
-        # Último recurso: listar modelos y aceptar Gemini de texto aunque el SDK
-        # no exponga supported_actions / supported_generation_methods igual.
-        available: list[str] = []
-        for model in client.models.list(config={"page_size": 100}):
-            name = str(getattr(model, "name", ""))
-            short_name = name.removeprefix("models/")
-            lowered = short_name.lower()
-            if not short_name or "gemini" not in lowered:
-                continue
-            if any(token in lowered for token in ("embedding", "imagen", "image", "tts", "live")):
-                continue
-            available.append(short_name)
-
-        for preferred in PREFERRED_MODELS:
-            if preferred in available:
-                return preferred, None
-        flash_models = sorted(model for model in available if "flash" in model.lower())
-        if flash_models:
-            return flash_models[-1], None
-        if available:
-            return available[0], None
-        return None, "La clave Gemini respondió, pero no expuso un modelo de texto utilizable."
-    except Exception as exc:
-        return None, friendly_ai_error(exc)
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+    requested_short = str(requested_model or "").removeprefix("models/").strip()
+    if requested_short:
+        return requested_short, None
+    # Modelo estable recomendado actualmente para proyectos nuevos.
+    return PREFERRED_MODELS[0], None
 
 
 

@@ -176,6 +176,26 @@ def _valid_entity_key(key: str, minimum_length: int = 4) -> bool:
     return bool(key) and len(key) >= minimum_length and any(character.isdigit() for character in key)
 
 
+def _equipment_match_key(value: Any) -> str:
+    """Clave estable para unir el mismo equipo aunque la API agregue sufijos.
+
+    Ejemplos reales:
+    ``QUADRA-1029`` y ``QUADRA-1029 AT Ex`` -> ``quadra1029``.
+    Se limita a familias con código inequívoco para no unir activos distintos por
+    una coincidencia difusa.
+    """
+    text = normalize_text(value)
+    if not text:
+        return ""
+    match = re.search(r"\b(quadra|auger|pmocam|pmo)\s+(\d+)\b", text)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    afi = re.search(r"\bafi\s+(\d+)\b", text)
+    if afi:
+        return f"afi{afi.group(1)}"
+    return ""
+
+
 def _sheet_name(value: Any) -> str:
     return normalize_text(value)
 
@@ -308,6 +328,7 @@ def canonicalize_excel(excel_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,
         history["equipment"] = history.groupby(grouping, dropna=False)["equipment"].ffill(limit=12)
 
     history["equipment_key"] = history["equipment"].map(normalize_identifier)
+    history["equipment_match_key"] = history["equipment"].map(_equipment_match_key)
     history["plate_key"] = history["plate"].map(normalize_identifier)
     history["vin_key"] = history["vin"].map(normalize_identifier)
     history["_update_parsed"] = history["update_date"].map(parse_date)
@@ -568,6 +589,7 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
         gps_rows["_gps_response_order"] = range(len(gps_rows))
 
     gps_rows["equipment_key"] = gps_rows["equipment"].map(normalize_identifier)
+    gps_rows["equipment_match_key"] = gps_rows["equipment"].map(_equipment_match_key)
     gps_rows["plate_key"] = gps_rows["plate"].map(normalize_identifier)
     gps_rows["vin_key"] = gps_rows["vin"].map(normalize_identifier)
     gps_rows["gps_identity_key"] = gps_rows.apply(_gps_identity, axis=1)
@@ -606,6 +628,7 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
             na_position="first",
         ).iloc[-1]
         record["equipment_key"] = normalize_identifier(record.get("equipment"))
+        record["equipment_match_key"] = _equipment_match_key(record.get("equipment"))
         record["plate_key"] = normalize_identifier(record.get("plate"))
         record["vin_key"] = normalize_identifier(record.get("vin"))
         record["timestamp_parsed"] = parse_date(record.get("timestamp")) or best_row.get("timestamp_parsed")
@@ -699,6 +722,12 @@ def _cert_summary(group: pd.DataFrame, field: str) -> tuple[pd.Timestamp | None,
 
 
 def _gps_candidates_for_group(group: pd.DataFrame, gps: pd.DataFrame) -> pd.DataFrame:
+    """Busca la fila API del equipo con coincidencias seguras.
+
+    Primero usa nombre exacto/patente/VIN. Además permite una clave de familia y
+    número (p. ej. QUADRA-1029) para resolver el caso común donde Excel guarda
+    ``QUADRA-1029`` y la API reporta ``QUADRA-1029 AT Ex``.
+    """
     if gps.empty:
         return gps
     equipment_keys = set(key for key in group["equipment_key"].tolist() if key)
@@ -709,7 +738,47 @@ def _gps_candidates_for_group(group: pd.DataFrame, gps: pd.DataFrame) -> pd.Data
         | gps["plate_key"].isin(plate_keys)
         | gps["vin_key"].isin(vin_keys)
     )
+
+    match_keys = set()
+    if "equipment_match_key" in group.columns and "equipment_match_key" in gps.columns:
+        match_keys = {key for key in group["equipment_match_key"].tolist() if key}
+        if len(match_keys) == 1:
+            mask = mask | gps["equipment_match_key"].isin(match_keys)
     return gps.loc[mask]
+
+
+def _merge_gps_candidates(candidates: pd.DataFrame) -> pd.Series | None:
+    """Fusiona variantes API del mismo activo campo a campo.
+
+    Evita perder Faena/Lugar/Estado cuando un endpoint reporta el nombre con un
+    sufijo diferente y otro endpoint contiene los datos operacionales completos.
+    """
+    if candidates.empty:
+        return None
+    record: dict[str, Any] = {}
+    for field in GPS_CANONICAL_FIELDS:
+        if field in candidates.columns:
+            record[field] = _pick_gps_group_value(candidates, field)
+        else:
+            record[field] = pd.NA
+    ordered = candidates.sort_values(
+        ["_has_timestamp", "timestamp_parsed", "_completeness", "_gps_response_order"],
+        ascending=True,
+        na_position="first",
+    )
+    best = ordered.iloc[-1]
+    for field in (
+        "equipment_key", "equipment_match_key", "plate_key", "vin_key",
+        "gps_identity_key", "timestamp_parsed", "_has_timestamp", "_completeness",
+        "_gps_response_order", "_gps_type", "_gps_zone", "canonical_contract",
+        "equipment_category",
+    ):
+        if field in best.index:
+            record[field] = best.get(field)
+    # Mantiene el nombre más informativo encontrado.
+    if is_empty(record.get("equipment")):
+        record["equipment"] = best.get("equipment")
+    return pd.Series(record)
 
 
 def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[str]]]:
@@ -738,15 +807,10 @@ def consolidate_equipment(history: pd.DataFrame, gps: pd.DataFrame) -> tuple[pd.
 
     for entity_id, group in history.groupby("entity_id", sort=False):
         gps_candidates = _gps_candidates_for_group(group, gps)
-        gps_row: pd.Series | None = None
-        if not gps_candidates.empty:
-            gps_candidates = gps_candidates.sort_values(
-                ["_has_timestamp", "timestamp_parsed", "_completeness"],
-                ascending=True,
-                na_position="first",
-            )
-            gps_row = gps_candidates.iloc[-1]
-            gps_used.add(str(gps_row["gps_identity_key"]))
+        gps_row: pd.Series | None = _merge_gps_candidates(gps_candidates)
+        if gps_row is not None:
+            for identity in gps_candidates.get("gps_identity_key", pd.Series(dtype="object")).dropna().astype(str):
+                gps_used.add(identity)
 
         latest = {field: _latest_nonempty(group, field) for field in CANONICAL_FIELDS}
         gps_status = clean_display(gps_row.get("status"), default="") if gps_row is not None else ""
