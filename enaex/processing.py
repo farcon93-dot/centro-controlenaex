@@ -355,7 +355,20 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
     mapping, details = match_columns(gps_raw.columns, GPS_FIELD_ALIASES, threshold=80.0)
     gps_rows = pd.DataFrame(index=gps_raw.index)
     for field in GPS_CANONICAL_FIELDS:
-        gps_rows[field] = _coalesce(gps_raw, mapping.get(field, []))
+        columns = mapping.get(field, [])
+        # En la API puede coexistir, por ejemplo, `Lugar` con `nombre_lugar`.
+        # El primero puede venir vacío para algunos equipos mientras el segundo
+        # contiene el texto visible en el sistema de planificación. Se toman
+        # todas las columnas válidas detectadas y se usa la primera con dato
+        # compatible para cada fila.
+        result = pd.Series(pd.NA, index=gps_raw.index, dtype="object")
+        for column in columns:
+            values = gps_raw[column]
+            valid = values.map(lambda value: _valid_gps_field_value(field, value))
+            fill_mask = result.map(is_empty) & valid
+            if fill_mask.any():
+                result.loc[fill_mask] = values.loc[fill_mask]
+        gps_rows[field] = result
 
     for column in ("_gps_type", "_gps_zone", "_gps_response_order"):
         if column in gps_raw.columns:

@@ -5,7 +5,7 @@ import streamlit as st
 
 from enaex.configuration import CONTRACT_TARGETS
 from enaex.models import ApplicationData
-from enaex.normalize import format_date
+from enaex.normalize import clean_display, format_date
 from enaex.processing import (
     FACTORY_TRUCK_LABEL,
     POLVORIN_LABEL,
@@ -88,11 +88,12 @@ def render_faenas_page(data: ApplicationData) -> None:
             "Modelo": gps_filtered.get("model", pd.Series(index=gps_filtered.index, dtype="object")),
             "Horómetro": gps_filtered.get("hours", pd.Series(index=gps_filtered.index, dtype="object")),
             "Estado": gps_filtered.get("status", pd.Series(index=gps_filtered.index, dtype="object")),
-            "Lugar": gps_filtered.get("place", pd.Series(index=gps_filtered.index, dtype="object")),
-            "Última actualización": gps_filtered.get(
-                "timestamp_parsed", pd.Series(index=gps_filtered.index, dtype="datetime64[ns]")
+            "Lugar": gps_filtered.get("place", pd.Series(index=gps_filtered.index, dtype="object")).map(
+                lambda value: clean_display(value, default="N/A")
+            ),
+            "Fecha retorno a operación": gps_filtered.get(
+                "return_operation_date", pd.Series(index=gps_filtered.index, dtype="object")
             ).map(format_date),
-            "Faena reportada": gps_filtered.get("faena", pd.Series(index=gps_filtered.index, dtype="object")),
         }
     )
     display = display.dropna(axis=1, how="all")

@@ -590,3 +590,32 @@ def test_critical_certifications_use_planning_api_and_all_equipment_types() -> N
     assert set(critical["status"]) == {"🟡 Vence pronto", "🔴 Vencida"}
     # Solo amarillo/rojo: el Sernageomin verde de 45 días no aparece.
     assert not ((critical["equipment"] == "QUADRA-1001") & (critical["document"] == "Sernageomin")).any()
+
+
+def test_gps_place_falls_back_to_nombre_lugar_when_lugar_is_empty() -> None:
+    gps = pd.DataFrame(
+        [
+            {
+                "Equipo": "QUADRA-1052 MT EX",
+                "Faena": "Lomas Bayas",
+                "Lugar": None,
+                "nombre_lugar": "Faena",
+                "Estado": "OK",
+                "Fecha Retorno Operacion": "02-10-2026",
+            },
+            {
+                "Equipo": "QUADRA-88 AT Ex",
+                "Faena": "Lomas Bayas",
+                "Lugar": None,
+                "nombre_lugar": "INDUMAR",
+                "Estado": "CORRECTIVO-F",
+                "Fecha Retorno Operacion": "01-10-2026",
+            },
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps, settings())
+    by_equipment = data.gps.set_index("equipment")
+    assert by_equipment.loc["QUADRA-1052 MT EX", "place"] == "Faena"
+    assert by_equipment.loc["QUADRA-88 AT Ex", "place"] == "INDUMAR"
+    assert format_date(by_equipment.loc["QUADRA-1052 MT EX", "return_operation_date"]) == "02/10/2026"
+    assert format_date(by_equipment.loc["QUADRA-88 AT Ex", "return_operation_date"]) == "01/10/2026"

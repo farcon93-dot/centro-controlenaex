@@ -225,7 +225,7 @@ GPS_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
 }
 
 GPS_SINGLE_SOURCE_FIELDS = {
-    "place", "condition", "status", "return_operation_date", "days_out_service",
+    "condition", "status", "return_operation_date", "days_out_service",
     "next_maintenance_date", "revision_tecnica_date", "sernageomin_date", "dgmn_date",
     "revision_tecnica_days", "sernageomin_days", "dgmn_days",
 }
