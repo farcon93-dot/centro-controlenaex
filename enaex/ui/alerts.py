@@ -44,12 +44,12 @@ def _render_cross_audit(data: ApplicationData, settings: Settings, ai_model: str
     st.divider()
     st.subheader("🤖 Auditoría cruzada — Sistema de planificación vs Excel")
     st.caption(
-        "La app calcula primero las diferencias de forma determinística. Gemini solo las interpreta y prioriza; "
-        "no decide qué fuente es correcta ni inventa datos faltantes."
+        "La app cruza el sistema de planificación exclusivamente contra la hoja En proceso del Excel. "
+        "Estatus MP y Fecha Entrega determinan si el equipo debe estar en Faena o Taller. Gemini solo interpreta y prioriza."
     )
 
     try:
-        discrepancies = build_cross_source_discrepancies(data.equipment)
+        discrepancies = build_cross_source_discrepancies(data.equipment, history=data.history)
     except Exception:
         # La auditoría cruzada es complementaria: nunca debe derribar Alertas.
         st.warning(
@@ -86,16 +86,16 @@ def _render_cross_audit(data: ApplicationData, settings: Settings, ai_model: str
             "faena": "Faena",
             "issue_type": "Tipo",
             "system_place": "Sistema planificación",
-            "excel_place": "Excel semanal",
+            "excel_place": "Excel (En proceso)",
             "system_return_date": "Retorno sistema",
-            "excel_return_date": "Retorno/entrega Excel",
+            "excel_return_date": "Fecha Entrega (En proceso)",
             "date_difference_days": "Diferencia días",
             "detail": "Detalle",
         }
     )
     visible_columns = [
-        "Equipo", "Faena", "Tipo", "Sistema planificación", "Excel semanal",
-        "Retorno sistema", "Retorno/entrega Excel", "Diferencia días", "Detalle",
+        "Equipo", "Faena", "Tipo", "Sistema planificación", "Excel (En proceso)",
+        "Retorno sistema", "Fecha Entrega (En proceso)", "Diferencia días", "Detalle",
     ]
     display = display.reindex(columns=visible_columns).copy()
     # Streamlit/Arrow puede fallar con columnas object que mezclan pd.NA e int.

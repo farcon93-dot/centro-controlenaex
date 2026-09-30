@@ -1859,14 +1859,101 @@ def search_equipment_ids(
 
 
 
+
+def _is_en_process_sheet(value: Any) -> bool:
+    """Identifica exclusivamente la hoja operacional ``En proceso`` del Excel."""
+    text = normalize_text(value)
+    return text == "en proceso" or text.startswith("en proceso ")
+
+
+def _build_en_process_audit_snapshot(history: pd.DataFrame) -> pd.DataFrame:
+    """Obtiene el último estado operativo por equipo desde la hoja ``En proceso``.
+
+    Esta vista se usa SOLO para la auditoría cruzada. No modifica Mov. equipos,
+    contratos, fichas técnicas ni proyecciones de capacidad.
+
+    Reglas de selección:
+    - se consideran únicamente filas de la hoja ``En proceso``;
+    - para cada equipo se toma el último registro de la hoja (fecha de actualización
+      si existe y, en empate/ausencia, el orden real de la fila en el Excel);
+    - Estado = columna ``Estatus MP``/equivalente ya normalizada como ``status``;
+    - Fecha Entrega = ``end_date``;
+    - Taller = ``workshop``.
+    """
+    columns = [
+        "entity_id", "audit_status", "audit_workshop", "audit_start_date",
+        "audit_delivery_date", "audit_source_sheet", "audit_source_row",
+    ]
+    if history is None or history.empty or "_source_sheet" not in history.columns:
+        return pd.DataFrame(columns=columns)
+
+    subset = history[history["_source_sheet"].map(_is_en_process_sheet)].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=columns)
+
+    # Un registro útil debe aportar al menos estado, taller o alguna fecha.
+    useful = pd.Series(False, index=subset.index)
+    for field in ("status", "workshop", "start_date", "end_date"):
+        if field in subset.columns:
+            useful = useful | ~subset[field].map(is_empty)
+    subset = subset.loc[useful].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=columns)
+
+    subset["_audit_start"] = subset["start_date"].map(parse_date)
+    subset["_audit_delivery"] = subset["end_date"].map(parse_date)
+    if "_update_parsed" not in subset.columns:
+        subset["_update_parsed"] = pd.NaT
+    if "_has_update" not in subset.columns:
+        subset["_has_update"] = subset["_update_parsed"].notna().astype(int)
+    if "_global_order" not in subset.columns:
+        subset["_global_order"] = range(len(subset))
+
+    rows: list[dict[str, Any]] = []
+    for entity_id, group in subset.groupby("entity_id", sort=False):
+        # Importante: NO usamos max(Fecha Entrega). Se usa la última fila operativa
+        # del equipo en En proceso. Esto evita que una planificación futura/histórica
+        # desplace al registro vigente solo por tener una fecha mayor.
+        ordered = group.sort_values(
+            ["_has_update", "_update_parsed", "_global_order"],
+            ascending=True,
+            na_position="first",
+        )
+        anchor = ordered.iloc[-1]
+        rows.append(
+            {
+                "entity_id": str(entity_id),
+                "audit_status": clean_display(anchor.get("status"), default="N/A"),
+                "audit_workshop": clean_display(anchor.get("workshop"), default="N/A"),
+                "audit_start_date": anchor.get("_audit_start"),
+                "audit_delivery_date": anchor.get("_audit_delivery"),
+                "audit_source_sheet": clean_display(anchor.get("_source_sheet"), default="En proceso"),
+                "audit_source_row": anchor.get("_source_row"),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def build_cross_source_discrepancies(
     equipment: pd.DataFrame,
     today: pd.Timestamp | None = None,
+    history: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Detecta diferencias objetivas entre sistema de planificación y Excel semanal.
+    """Detecta diferencias objetivas entre sistema de planificación y Excel.
 
-    Es deliberadamente tolerante a datos incompletos o tipos inesperados provenientes
-    de API/Excel. Un registro mal formado nunca debe derribar la pantalla de Alertas.
+    Cuando se entrega ``history`` (caso normal de la aplicación), la ubicación
+    esperada desde Excel se determina EXCLUSIVAMENTE con la hoja ``En proceso``:
+
+    - Estatus MP ``Listo``/entregado/finalizado => equipo entregado, está en Faena.
+    - Estatus MP ``En proceso``/en taller => equipo continúa en el taller indicado.
+    - Si el estatus no resuelve el caso y la última ``Fecha Entrega`` ya pasó => Faena.
+    - Si la intervención está vigente y todavía no llega la Fecha Entrega => Taller.
+    - Si el equipo no aparece en ``En proceso``, NO se inventa una discrepancia usando
+      registros de ``Mov. equipos`` u otras hojas.
+
+    El comportamiento legacy sin ``history`` se conserva solo por compatibilidad de
+    pruebas/llamadas antiguas; la UI productiva siempre envía ``data.history``.
     """
     columns = [
         "equipment", "faena", "issue_type", "system_place", "excel_place",
@@ -1910,55 +1997,83 @@ def build_cross_source_discrepancies(
             return "workshop", text
         return "unknown", text
 
-    def excel_location(row: pd.Series) -> tuple[str, str, str]:
+    # Snapshot exclusivo de la hoja En proceso para la auditoría real.
+    audit_snapshot = _build_en_process_audit_snapshot(history) if history is not None else pd.DataFrame()
+    audit_by_entity: dict[str, dict[str, Any]] = {}
+    if not audit_snapshot.empty:
+        audit_by_entity = audit_snapshot.set_index("entity_id").to_dict("index")
+
+    def excel_location_from_en_process(row: pd.Series) -> tuple[str, str, str, pd.Timestamp | None]:
+        entity_id = str(row.get("entity_id", ""))
+        audit = audit_by_entity.get(entity_id)
+        if audit is None:
+            return "unknown", "N/A", "No aparece en hoja En proceso", None
+
+        status_text = valid_text(audit.get("audit_status"))
+        status = normalize_text(status_text)
+        workshop = valid_text(audit.get("audit_workshop"))
+        start = safe_date(audit.get("audit_start_date"))
+        delivery = safe_date(audit.get("audit_delivery_date"))
+
+        # Regla de negocio entregada por el usuario: Estatus MP manda.
+        is_ready = any(token in status for token in ("listo", "entregado", "finalizado"))
+        if is_ready:
+            if delivery is not None and delivery.normalize() <= current_day:
+                basis = f"En proceso: Estatus {status_text} y Fecha Entrega {format_date(delivery)} ya cumplida"
+            else:
+                basis = f"En proceso: Estatus {status_text} indica equipo entregado"
+            return "faena", "Faena", basis, delivery
+
+        in_process = any(token in status for token in ("en proceso", "en taller"))
+        if in_process:
+            if workshop:
+                return "workshop", workshop, f"En proceso: Estatus {status_text}", delivery
+            return "unknown", "N/A", f"En proceso: Estatus {status_text}, sin taller informado", delivery
+
+        # Si el estado no es concluyente, la Fecha Entrega resuelve el pasado.
+        if delivery is not None and delivery.normalize() < current_day:
+            return "faena", "Faena", f"En proceso: Fecha Entrega {format_date(delivery)} anterior a hoy", delivery
+
+        # Intervención vigente: ya comenzó y aún no vence la entrega.
+        if workshop and start is not None and start.normalize() <= current_day:
+            if delivery is None or current_day <= delivery.normalize():
+                return "workshop", workshop, "En proceso: intervención vigente por fechas", delivery
+
+        # Si todavía no comienza, el equipo se entiende en Faena hasta la bajada.
+        if start is not None and current_day < start.normalize():
+            return "faena", "Faena", "En proceso: Fecha Inicio futura", delivery
+
+        return "unknown", "N/A", "Registro En proceso sin estado/fechas suficientes", delivery
+
+    def excel_location_legacy(row: pd.Series) -> tuple[str, str, str, pd.Timestamp | None]:
+        """Compatibilidad para llamadas antiguas que no entregan history."""
         start = safe_date(row.get("start_date"))
         end = safe_date(row.get("end_date"))
         latest_delivery = safe_date(row.get("latest_delivery_date")) or end
         planned_workshop = valid_text(row.get("planned_workshop"))
         latest_workshop = valid_text(row.get("workshop"))
-
-        # El estado de Mov. equipos es el que define si la intervención sigue
-        # abierta o ya fue entregada. planning_status queda como respaldo para
-        # versiones antiguas de los datos consolidados.
         movement_status = normalize_text(valid_text(row.get("movement_status")))
         planning_status = normalize_text(valid_text(row.get("planning_status")))
         effective_status = movement_status if movement_status else planning_status
         detail = normalize_text(valid_text(row.get("status_detail")))
 
-        # Regla operacional acordada:
-        # - LISTO = equipo ya entregado, por lo tanto debe considerarse en Faena.
-        # - EN PROCESO = equipo todavía en taller.
-        # Estas reglas tienen prioridad sobre las ventanas de fechas para no
-        # generar falsos positivos con registros históricos o planes extendidos.
-        is_ready = any(token in effective_status for token in ("listo", "entregado", "finalizado"))
-        if is_ready:
-            return "faena", "Faena", "Estatus Listo/entregado en Mov. equipos"
-
-        in_process = any(token in effective_status for token in ("en proceso", "en taller"))
-        if in_process:
+        if any(token in effective_status for token in ("listo", "entregado", "finalizado")):
+            return "faena", "Faena", "Estatus Listo/entregado", latest_delivery
+        if any(token in effective_status for token in ("en proceso", "en taller")):
             workshop = planned_workshop or latest_workshop
             if workshop:
-                return "workshop", workshop, "Estatus En proceso en Mov. equipos"
-
-        # Si la última Fecha Entrega registrada ya ocurrió, el equipo se entiende
-        # devuelto a faena aunque existan movimientos históricos de taller.
+                return "workshop", workshop, "Estatus En proceso", latest_delivery
         if latest_delivery is not None and latest_delivery.normalize() < current_day:
-            return "faena", "Faena", "Última Fecha Entrega anterior a hoy"
-
-        # Para estados pendientes/sin estado, se usa la ventana vigente del plan.
+            return "faena", "Faena", "Última Fecha Entrega anterior a hoy", latest_delivery
         if start is not None and start <= current_day and (end is None or current_day <= end) and planned_workshop:
-            return "workshop", planned_workshop, "Mov. equipos vigente"
-
-        mentions_workshop = "taller" in detail
-        if latest_workshop and mentions_workshop:
-            return "workshop", latest_workshop, "Estado de equipos menciona taller"
-
+            return "workshop", planned_workshop, "Plan vigente", latest_delivery
+        if latest_workshop and "taller" in detail:
+            return "workshop", latest_workshop, "Estado de equipos menciona taller", latest_delivery
         if start is not None and current_day < start:
-            return "faena", "Faena", "Bajada futura en Mov. equipos"
+            return "faena", "Faena", "Bajada futura", latest_delivery
         if end is not None and current_day > end:
-            return "faena", "Faena", "Entrega a faena ya programada"
-
-        return "unknown", "N/A", "Sin ubicación Excel comparable"
+            return "faena", "Faena", "Entrega ya programada", latest_delivery
+        return "unknown", "N/A", "Sin ubicación Excel comparable", latest_delivery
 
     for _, row in equipment.iterrows():
         try:
@@ -1966,7 +2081,10 @@ def build_cross_source_discrepancies(
             faena = valid_text(row.get("gps_faena")) or valid_text(row.get("planned_faena")) or "N/A"
 
             sys_kind, sys_label = system_location(row.get("gps_place"))
-            excel_kind, excel_label, excel_basis = excel_location(row)
+            if history is not None:
+                excel_kind, excel_label, excel_basis, excel_delivery = excel_location_from_en_process(row)
+            else:
+                excel_kind, excel_label, excel_basis, excel_delivery = excel_location_legacy(row)
 
             location_detail = ""
             if sys_kind != "unknown" and excel_kind != "unknown":
@@ -2001,8 +2119,12 @@ def build_cross_source_discrepancies(
                     "detail": location_detail,
                 })
 
+            # Para producción, la fecha Excel también sale de En proceso / Fecha Entrega.
             system_return = safe_date(row.get("return_operation_date"))
-            excel_return = safe_date(row.get("end_date"))
+            if history is None:
+                excel_return = safe_date(row.get("end_date"))
+            else:
+                excel_return = excel_delivery
             if system_return is not None and excel_return is not None:
                 difference = int((system_return.normalize() - excel_return.normalize()).days)
                 if difference != 0:
@@ -2016,9 +2138,8 @@ def build_cross_source_discrepancies(
                         "excel_return_date": format_date(excel_return),
                         "date_difference_days": difference,
                         "detail": (
-                            f"Fecha retorno del sistema: {format_date(system_return)}; "
-                            f"fecha entrega/subida del Excel: {format_date(excel_return)}; "
-                            f"diferencia: {abs(difference)} día(s)."
+                            f"Retorno sistema {format_date(system_return)} vs Fecha Entrega de En proceso "
+                            f"{format_date(excel_return)} ({difference:+d} días)."
                         ),
                     })
         except Exception:

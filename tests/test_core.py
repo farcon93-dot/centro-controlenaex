@@ -1067,3 +1067,217 @@ def test_cross_audit_latest_delivery_before_today_means_faena() -> None:
 
     result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-30"))
     assert result[result["issue_type"].eq("Ubicación")].empty
+
+
+def test_cross_audit_uses_only_en_proceso_and_listo_means_faena() -> None:
+    """Caso real Q-1021: Mov. equipos puede decir Full RPM, pero En proceso ya está Listo."""
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "entity_id": "eq-q1021",
+            "equipment": "QUADRA-1021 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            # Estos campos de Mov. equipos NO deben mandar en la auditoría v4.5.
+            "planned_workshop": "Full RPM",
+            "movement_status": "En proceso",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-10"),
+            "return_operation_date": pd.NaT,
+        }
+    ])
+    history = pd.DataFrame([
+        {
+            "entity_id": "eq-q1021",
+            "_source_sheet": "En proceso",
+            "_source_row": 10,
+            "_global_order": 10,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "Listo",
+            "workshop": "Full RPM",
+            "start_date": pd.Timestamp("2026-07-21"),
+            "end_date": pd.Timestamp("2026-07-30"),
+        },
+        {
+            "entity_id": "eq-q1021",
+            "_source_sheet": "Mov. equipos",
+            "_source_row": 20,
+            "_global_order": 20,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "En proceso",
+            "workshop": "Full RPM",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-10"),
+        },
+    ])
+
+    result = build_cross_source_discrepancies(
+        equipment, today=pd.Timestamp("2026-09-30"), history=history
+    )
+    assert result[result["issue_type"].eq("Ubicación")].empty
+
+
+def test_cross_audit_en_proceso_sheet_status_en_proceso_means_workshop() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "entity_id": "eq-2000",
+            "equipment": "QUADRA-2000 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "return_operation_date": pd.NaT,
+        }
+    ])
+    history = pd.DataFrame([
+        {
+            "entity_id": "eq-2000",
+            "_source_sheet": "En proceso",
+            "_source_row": 5,
+            "_global_order": 5,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "En proceso",
+            "workshop": "SKC Calama",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-05"),
+        }
+    ])
+    result = build_cross_source_discrepancies(
+        equipment, today=pd.Timestamp("2026-09-30"), history=history
+    )
+    location = result[result["issue_type"].eq("Ubicación")]
+    assert len(location) == 1
+    assert location.iloc[0]["excel_place"] == "SKC Calama"
+    assert "En proceso" in location.iloc[0]["detail"]
+
+
+def test_cross_audit_equipment_absent_from_en_proceso_is_not_flagged_from_mov_equipos() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "entity_id": "eq-3000",
+            "equipment": "QUADRA-3000 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "planned_workshop": "SKC Calama",
+            "movement_status": "En proceso",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-05"),
+            "return_operation_date": pd.NaT,
+        }
+    ])
+    history = pd.DataFrame([
+        {
+            "entity_id": "eq-9999",
+            "_source_sheet": "En proceso",
+            "_source_row": 1,
+            "_global_order": 1,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "En proceso",
+            "workshop": "SKC Calama",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-05"),
+        },
+        {
+            "entity_id": "eq-3000",
+            "_source_sheet": "Mov. equipos",
+            "_source_row": 2,
+            "_global_order": 2,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "En proceso",
+            "workshop": "SKC Calama",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-05"),
+        },
+    ])
+    result = build_cross_source_discrepancies(
+        equipment, today=pd.Timestamp("2026-09-30"), history=history
+    )
+    assert result.empty
+
+
+def test_cross_audit_uses_last_row_in_en_proceso_not_max_delivery_date() -> None:
+    """La última fila operativa manda aunque una fila histórica tenga una entrega posterior."""
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "entity_id": "eq-4000",
+            "equipment": "QUADRA-4000",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "return_operation_date": pd.NaT,
+        }
+    ])
+    history = pd.DataFrame([
+        {
+            "entity_id": "eq-4000",
+            "_source_sheet": "En proceso",
+            "_source_row": 1,
+            "_global_order": 1,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "En proceso",
+            "workshop": "Full RPM",
+            "start_date": pd.Timestamp("2026-12-01"),
+            "end_date": pd.Timestamp("2027-03-02"),
+        },
+        {
+            "entity_id": "eq-4000",
+            "_source_sheet": "En proceso",
+            "_source_row": 2,
+            "_global_order": 2,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "Listo",
+            "workshop": "Full RPM",
+            "start_date": pd.Timestamp("2026-07-21"),
+            "end_date": pd.Timestamp("2026-07-30"),
+        },
+    ])
+    result = build_cross_source_discrepancies(
+        equipment, today=pd.Timestamp("2026-09-30"), history=history
+    )
+    assert result.empty
+
+
+def test_cross_audit_date_difference_uses_fecha_entrega_from_en_proceso() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "entity_id": "eq-5000",
+            "equipment": "QUADRA-5000",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "return_operation_date": pd.Timestamp("2026-10-12"),
+        }
+    ])
+    history = pd.DataFrame([
+        {
+            "entity_id": "eq-5000",
+            "_source_sheet": "En proceso",
+            "_source_row": 2,
+            "_global_order": 2,
+            "_has_update": 0,
+            "_update_parsed": pd.NaT,
+            "status": "Listo",
+            "workshop": "SKC Calama",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-10"),
+        }
+    ])
+    result = build_cross_source_discrepancies(
+        equipment, today=pd.Timestamp("2026-09-30"), history=history
+    )
+    dates = result[result["issue_type"].eq("Fecha retorno")]
+    assert len(dates) == 1
+    assert dates.iloc[0]["excel_return_date"] == "10/10/2026"
+    assert int(dates.iloc[0]["date_difference_days"]) == 2
