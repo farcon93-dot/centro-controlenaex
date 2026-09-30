@@ -987,3 +987,83 @@ def test_blank_api_place_propagates_to_equipment_card_as_faena() -> None:
     data = build_application_data(excel, gps, settings())
     row = data.equipment.iloc[0]
     assert row["gps_place"] == "Faena"
+
+
+def test_cross_audit_listo_means_already_delivered_even_if_plan_window_is_active() -> None:
+    """Caso real: Q-1021 figura Faena en sistema y Listo en Mov. equipos.
+
+    Listo tiene prioridad sobre una ventana start/end que todavía pudiera parecer
+    vigente, por lo que NO debe marcar discrepancia de ubicación.
+    """
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "equipment": "QUADRA-1021 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "planned_workshop": "Full RPM",
+            "workshop": "Full RPM",
+            "movement_status": "Listo",
+            "planning_status": "Listo",
+            "status_detail": "Equipo finalizado",
+            "start_date": pd.Timestamp("2026-09-01"),
+            "end_date": pd.Timestamp("2026-10-15"),
+            "latest_delivery_date": pd.Timestamp("2026-09-20"),
+            "return_operation_date": pd.NaT,
+        }
+    ])
+
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-30"))
+    assert result[result["issue_type"].eq("Ubicación")].empty
+
+
+def test_cross_audit_en_proceso_means_workshop() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "equipment": "QUADRA-2000 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "planned_workshop": "SKC Calama",
+            "workshop": "SKC Calama",
+            "movement_status": "En proceso",
+            "planning_status": "En proceso",
+            "status_detail": "Equipo en reparación",
+            "start_date": pd.Timestamp("2026-09-20"),
+            "end_date": pd.Timestamp("2026-10-10"),
+            "latest_delivery_date": pd.Timestamp("2026-10-10"),
+            "return_operation_date": pd.NaT,
+        }
+    ])
+
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-30"))
+    location = result[result["issue_type"].eq("Ubicación")]
+    assert len(location) == 1
+    assert location.iloc[0]["system_place"] == "Faena"
+    assert location.iloc[0]["excel_place"] == "SKC Calama"
+
+
+def test_cross_audit_latest_delivery_before_today_means_faena() -> None:
+    from enaex.processing import build_cross_source_discrepancies
+
+    equipment = pd.DataFrame([
+        {
+            "equipment": "QUADRA-2001 AT Ex",
+            "gps_faena": "Andina",
+            "gps_place": "Faena",
+            "planned_workshop": "Full RPM",
+            "workshop": "Full RPM",
+            "movement_status": "Pendiente",
+            "planning_status": "Pendiente",
+            "status_detail": "",
+            "start_date": pd.Timestamp("2026-09-01"),
+            "end_date": pd.Timestamp("2026-09-25"),
+            "latest_delivery_date": pd.Timestamp("2026-09-25"),
+            "return_operation_date": pd.NaT,
+        }
+    ])
+
+    result = build_cross_source_discrepancies(equipment, today=pd.Timestamp("2026-09-30"))
+    assert result[result["issue_type"].eq("Ubicación")].empty

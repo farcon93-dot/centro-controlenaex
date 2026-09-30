@@ -1319,6 +1319,13 @@ def build_movements(history: pd.DataFrame, equipment: pd.DataFrame) -> pd.DataFr
         if pd.isna(end):
             end = parse_date(_latest_movement_value(group, "end_date"))
 
+        # Para la auditoría cruzada conservamos además la ÚLTIMA fecha de entrega
+        # registrada en Mov. equipos. Esto es independiente del registro elegido
+        # como planificación vigente y evita interpretar un taller histórico como
+        # ubicación actual cuando el equipo ya fue entregado a faena.
+        valid_deliveries = group["_movement_end"].dropna()
+        latest_delivery_date = valid_deliveries.max() if not valid_deliveries.empty else pd.NaT
+
         equipment_data = fallback.get(str(entity_id), {})
 
         def movement_value(field: str, fallback_field: str, default: str = "N/A") -> str:
@@ -1346,6 +1353,7 @@ def build_movements(history: pd.DataFrame, equipment: pd.DataFrame) -> pd.DataFr
                 "equipment": equipment_data.get("equipment", str(entity_id)),
                 "start_date": start,
                 "end_date": end,
+                "latest_delivery_date": latest_delivery_date,
                 "workshop": workshop,
                 "workshop_canonical": normalize_workshop(workshop),
                 "faena": faena,
@@ -1385,6 +1393,7 @@ def apply_movement_plan_to_equipment(
     result = equipment.copy()
     result["start_date"] = pd.NaT
     result["end_date"] = pd.NaT
+    result["latest_delivery_date"] = pd.NaT
     result["movement_source"] = "Sin planificación en Mov. equipos"
     result["movement_status"] = "N/A"
     result["movement_comments"] = "N/A"
@@ -1403,6 +1412,7 @@ def apply_movement_plan_to_equipment(
             movement = movement.iloc[-1]
         result.at[index, "start_date"] = movement.get("start_date")
         result.at[index, "end_date"] = movement.get("end_date")
+        result.at[index, "latest_delivery_date"] = movement.get("latest_delivery_date")
         result.at[index, "movement_source"] = movement.get("source", "Mov. equipos")
         result.at[index, "movement_status"] = clean_display(movement.get("status"))
         result.at[index, "movement_comments"] = clean_display(movement.get("comments"))
@@ -1903,18 +1913,45 @@ def build_cross_source_discrepancies(
     def excel_location(row: pd.Series) -> tuple[str, str, str]:
         start = safe_date(row.get("start_date"))
         end = safe_date(row.get("end_date"))
+        latest_delivery = safe_date(row.get("latest_delivery_date")) or end
         planned_workshop = valid_text(row.get("planned_workshop"))
         latest_workshop = valid_text(row.get("workshop"))
+
+        # El estado de Mov. equipos es el que define si la intervención sigue
+        # abierta o ya fue entregada. planning_status queda como respaldo para
+        # versiones antiguas de los datos consolidados.
+        movement_status = normalize_text(valid_text(row.get("movement_status")))
         planning_status = normalize_text(valid_text(row.get("planning_status")))
+        effective_status = movement_status if movement_status else planning_status
         detail = normalize_text(valid_text(row.get("status_detail")))
 
+        # Regla operacional acordada:
+        # - LISTO = equipo ya entregado, por lo tanto debe considerarse en Faena.
+        # - EN PROCESO = equipo todavía en taller.
+        # Estas reglas tienen prioridad sobre las ventanas de fechas para no
+        # generar falsos positivos con registros históricos o planes extendidos.
+        is_ready = any(token in effective_status for token in ("listo", "entregado", "finalizado"))
+        if is_ready:
+            return "faena", "Faena", "Estatus Listo/entregado en Mov. equipos"
+
+        in_process = any(token in effective_status for token in ("en proceso", "en taller"))
+        if in_process:
+            workshop = planned_workshop or latest_workshop
+            if workshop:
+                return "workshop", workshop, "Estatus En proceso en Mov. equipos"
+
+        # Si la última Fecha Entrega registrada ya ocurrió, el equipo se entiende
+        # devuelto a faena aunque existan movimientos históricos de taller.
+        if latest_delivery is not None and latest_delivery.normalize() < current_day:
+            return "faena", "Faena", "Última Fecha Entrega anterior a hoy"
+
+        # Para estados pendientes/sin estado, se usa la ventana vigente del plan.
         if start is not None and start <= current_day and (end is None or current_day <= end) and planned_workshop:
             return "workshop", planned_workshop, "Mov. equipos vigente"
 
-        in_process = any(token in planning_status for token in ("en proceso", "en taller"))
         mentions_workshop = "taller" in detail
-        if latest_workshop and (in_process or mentions_workshop):
-            return "workshop", latest_workshop, "Estado de equipos / En proceso"
+        if latest_workshop and mentions_workshop:
+            return "workshop", latest_workshop, "Estado de equipos menciona taller"
 
         if start is not None and current_day < start:
             return "faena", "Faena", "Bajada futura en Mov. equipos"
