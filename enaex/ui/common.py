@@ -63,7 +63,7 @@ def _format_mapping(mapping: dict[str, list[str]]) -> pd.DataFrame:
 def render_sidebar(data: ApplicationData, ai_model: str | None, ai_error: str | None, refresh_callback: Any) -> None:
     with st.sidebar:
         st.header("Estado del sistema")
-        st.caption("Versión 2026.09.30.4.6 · CERTIFICACIONES API DIRECTA")
+        st.caption("Versión 2026.10.01.4.7 · CERTIFICACIONES RAW COHERENTES")
         st.metric("Equipos consolidados", len(data.equipment))
         st.metric("Equipos GPS únicos", len(data.gps))
         st.metric("Camiones fábrica GPS", int(data.diagnostics.get("gps_factory_trucks", 0)))
@@ -100,6 +100,23 @@ def render_sidebar(data: ApplicationData, ai_model: str | None, ai_error: str | 
         with st.expander("Diagnóstico de columnas GPS"):
             mapping = data.diagnostics.get("gps_column_mapping", {})
             st.dataframe(_format_mapping(mapping), hide_index=True, use_container_width=True)
+            cert_columns = data.diagnostics.get("gps_direct_certificate_columns", {}) or {}
+            cert_counts = data.diagnostics.get("gps_direct_certificate_values", {}) or {}
+            if cert_columns or cert_counts:
+                labels = {
+                    "revision_tecnica_days": "RT",
+                    "sernageomin_days": "Sernageomin",
+                    "dgmn_days": "DGMN",
+                }
+                cert_rows = []
+                for field in ("revision_tecnica_days", "sernageomin_days", "dgmn_days"):
+                    cert_rows.append({
+                        "Documento": labels[field],
+                        "Columnas RAW detectadas": ", ".join(cert_columns.get(field, [])) or "No detectada",
+                        "Valores válidos": int(cert_counts.get(field, 0) or 0),
+                    })
+                st.caption("Lectura documental directa desde la API")
+                st.dataframe(pd.DataFrame(cert_rows), hide_index=True, use_container_width=True)
 
         with st.expander("Hojas Excel cargadas"):
             sheets = data.diagnostics.get("excel_sheets", [])

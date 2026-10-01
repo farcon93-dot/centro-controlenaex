@@ -1359,3 +1359,93 @@ def test_certificate_header_variants_sgmn_and_revtec_are_detected() -> None:
     assert int(docs["Revisión Técnica"]) == 8
     assert int(docs["Sernageomin"]) == 12
     assert "DGMN" not in docs
+
+
+def test_certificate_days_reject_date_like_strings() -> None:
+    from enaex.processing import parse_days_remaining
+    assert parse_days_remaining("30-09-2026") is None
+    assert parse_days_remaining("2026-09-30") is None
+    assert parse_days_remaining("🟢 29") == 29
+    assert parse_days_remaining("-3") == -3
+
+
+def test_certificate_raw_schema_variants_are_extracted_per_row() -> None:
+    from enaex.processing import build_planning_critical_certifications
+
+    gps_raw = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-TEST-1",
+            "Faena": "Andina",
+            "D_RT": 12,
+            "D_SGMN": 8,
+            "D_DGMN": 80,
+        },
+        {
+            "Equipo": "QUADRA-TEST-2",
+            "Faena": "Centinela",
+            "dias_revtec": -2,
+            "dias_sernageomin": 31,
+            "dias_dgmn": 3,
+        },
+    ])
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=pd.Timestamp("2026-10-01"))
+    pairs = {(r.equipment, r.document): int(r.days) for r in critical.itertuples()}
+    assert pairs[("QUADRA-TEST-1", "Revisión Técnica")] == 12
+    assert pairs[("QUADRA-TEST-1", "Sernageomin")] == 8
+    assert ("QUADRA-TEST-1", "DGMN") not in pairs
+    assert pairs[("QUADRA-TEST-2", "Revisión Técnica")] == -2
+    assert pairs[("QUADRA-TEST-2", "DGMN")] == 3
+    assert ("QUADRA-TEST-2", "Sernageomin") not in pairs
+
+
+def test_certificate_duplicate_records_use_one_complete_raw_triplet() -> None:
+    """Un duplicado parcial no debe reemplazar el trío documental completo."""
+    from enaex.processing import build_planning_critical_certifications
+
+    gps_raw = pd.DataFrame([
+        {
+            "Equipo": "AUGER-156 AT",
+            "Faena": "Rajo Inca",
+            "Lugar": "Faena",
+            "D: RT": 154,
+            "D: Sernageomin": 240,
+            "D: DGMN": 8,
+            "_gps_type": 24,
+            "_gps_zone": 3,
+            "_gps_response_order": 0,
+        },
+        {
+            "Equipo": "AUGER-156 AT",
+            "Faena": "Rajo Inca",
+            "D: DGMN": -21,
+            "_gps_type": 22,
+            "_gps_zone": 3,
+            "_gps_response_order": 0,
+        },
+    ])
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    row = data.gps.iloc[0]
+    assert int(row["revision_tecnica_days"]) == 154
+    assert int(row["sernageomin_days"]) == 240
+    assert int(row["dgmn_days"]) == 8
+    critical = build_planning_critical_certifications(data.gps, today=pd.Timestamp("2026-10-01"))
+    pairs = {(r.document, int(r.days)) for r in critical.itertuples()}
+    assert ("DGMN", 8) in pairs
+    assert ("DGMN", -21) not in pairs
+
+
+def test_certificate_triplet_from_exported_dashboard_reference() -> None:
+    """Referencia del PDF: QUADRA-1048 debe alertar RT y SNGM, no DGMN."""
+    from enaex.processing import build_planning_critical_certifications
+    gps_raw = pd.DataFrame([{
+        "Equipo": "QUADRA-1048 AT DEx",
+        "Faena": "Los Pelambres",
+        "D.RT": -3,
+        "D.Sernageomin": 29,
+        "D.DGMN": 36,
+    }])
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=pd.Timestamp("2026-09-30"))
+    docs = {r.document: int(r.days) for r in critical.itertuples()}
+    assert docs == {"Revisión Técnica": -3, "Sernageomin": 29}

@@ -139,7 +139,12 @@ def certification_equipment_category(value: Any) -> str:
 
 
 def parse_days_remaining(value: Any) -> int | None:
-    """Extrae días restantes desde valores como 140, -5 o "🟢 31"."""
+    """Extrae días restantes desde valores como 140, -5 o "🟢 31".
+
+    Importante: una fecha como ``30-09-2026`` NO es un contador de días.
+    Antes se tomaba accidentalmente el primer número de algunas fechas y eso
+    podía contaminar RT/Sernageomin/DGMN con valores falsos.
+    """
     if is_empty(value):
         return None
     if isinstance(value, bool):
@@ -152,7 +157,15 @@ def parse_days_remaining(value: Any) -> int | None:
             pass
         number = int(float(value))
         return number if -5000 <= number <= 5000 else None
-    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
+
+    text = str(value).strip()
+    # Rechaza fechas explícitas antes de buscar un entero dentro del texto.
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", text):
+        return None
+    if re.search(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", text):
+        return None
+
+    match = re.search(r"-?\d+(?:[.,]\d+)?", text)
     if not match:
         return None
     number = int(float(match.group(0).replace(",", ".")))
@@ -488,6 +501,107 @@ def _fill_from_raw_candidates(
     return result
 
 
+def _certificate_day_header_score(column: Any, document: str) -> float:
+    """Puntúa una llave RAW de la API como contador de días de certificado.
+
+    Se evalúa por registro antes del mapeo difuso global. Esto es importante
+    porque distintos tipos de equipo pueden usar llaves diferentes para RT,
+    Sernageomin y DGMN dentro de la misma descarga.
+    """
+    header = normalize_text(column)
+    compact = normalize_identifier(column)
+    if not header or str(column).startswith("_gps_"):
+        return 0.0
+    # Fechas/IDs no son contadores de días.
+    if any(token in header for token in (
+        "fecha", "vencimiento", "vigencia", "expiracion", "expiración", "date", "id ", "codigo", "código"
+    )):
+        return 0.0
+
+    doc = normalize_text(document)
+    if doc == "rt":
+        core = (
+            compact in {"rt", "drt", "diasrt", "rtdias", "diasrevisiontecnica", "revisiontecnicadias"}
+            or "revisiontecnica" in compact
+            or "revtecnica" in compact
+            or "revtec" in compact
+            or bool(re.search(r"(^|\\s)rt($|\\s)", header))
+        )
+    elif doc == "sernageomin":
+        core = any(token in compact for token in ("sernageomin", "sngm", "sgmn", "sernageo"))
+    else:
+        core = "dgmn" in compact or compact in {"dgm", "ddgm", "diasdgm"}
+    if not core:
+        return 0.0
+
+    score = 70.0
+    if any(token in header for token in ("dias", "días", "dias restantes", "d ")):
+        score += 20.0
+    if compact.startswith("d") or "dias" in compact:
+        score += 10.0
+    return score
+
+
+def _extract_direct_certificate_days(gps_raw: pd.DataFrame, document: str) -> tuple[pd.Series, list[str]]:
+    """Extrae el contador directamente de las llaves RAW, fila por fila.
+
+    No mezcla fechas con días y permite que un endpoint use ``D. RT`` mientras
+    otro use ``dias_rt`` o ``D_SGMN``. Devuelve también las columnas detectadas
+    para diagnóstico.
+    """
+    candidates: list[tuple[float, str]] = []
+    for column in gps_raw.columns:
+        score = _certificate_day_header_score(column, document)
+        if score <= 0:
+            continue
+        values = gps_raw[column].dropna().head(500)
+        if values.empty:
+            continue
+        valid_ratio = float(values.map(parse_days_remaining).notna().mean())
+        if valid_ratio < 0.20:
+            continue
+        candidates.append((score + valid_ratio * 10.0, str(column)))
+    candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    ordered_columns = [column for _, column in candidates]
+
+    result = pd.Series(pd.NA, index=gps_raw.index, dtype="object")
+    for column in ordered_columns:
+        if column not in gps_raw.columns:
+            continue
+        parsed = gps_raw[column].map(parse_days_remaining)
+        fill = result.map(is_empty) & parsed.notna()
+        if fill.any():
+            result.loc[fill] = parsed.loc[fill].astype("Int64")
+    return result, ordered_columns
+
+
+# Tipos usados por la versión original del dashboard. Al existir duplicados del
+# mismo equipo en tipos vecinos, una fila de estos tipos tiene prioridad SOLO
+# para escoger el trío documental; no modifica faena, contratos ni movimientos.
+_CERTIFICATE_PREFERRED_GPS_TYPES = {21, 23, 24, 26, 27, 41}
+
+
+def _pick_certificate_row(group: pd.DataFrame) -> pd.Series | None:
+    if group.empty:
+        return None
+    work = group.copy()
+    for field in ("_cert_rt_direct", "_cert_sngm_direct", "_cert_dgmn_direct"):
+        if field not in work.columns:
+            work[field] = pd.NA
+    work["_cert_direct_count"] = work[
+        ["_cert_rt_direct", "_cert_sngm_direct", "_cert_dgmn_direct"]
+    ].apply(lambda row: sum(parse_days_remaining(v) is not None for v in row), axis=1)
+    work["_cert_preferred_type"] = work.get("_gps_type", pd.Series(index=work.index, dtype=object)).map(
+        lambda value: int(value in _CERTIFICATE_PREFERRED_GPS_TYPES) if not is_empty(value) else 0
+    )
+    # Prefiere una fila que traiga el trío documental completo y, entre empates,
+    # una fuente histórica confiable y el registro operativo más completo.
+    sort_cols = ["_cert_direct_count", "_cert_preferred_type", "_has_timestamp", "timestamp_parsed", "_completeness"]
+    existing = [c for c in sort_cols if c in work.columns]
+    ordered = work.sort_values(existing, ascending=True, na_position="first")
+    return ordered.iloc[-1]
+
+
 def _infer_certificate_columns(gps_raw: pd.DataFrame, document: str) -> tuple[list[str], list[str]]:
     """Encuentra columnas de días/fecha de RT, Sernageomin o DGMN por esquema.
 
@@ -553,6 +667,12 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
 
     mapping, details = match_columns(gps_raw.columns, GPS_FIELD_ALIASES, threshold=80.0)
 
+    # Extracción documental RAW por fila. No depende de que toda la API use el
+    # mismo esquema y evita mezclar una fecha de vigencia con un contador de días.
+    direct_rt, direct_rt_columns = _extract_direct_certificate_days(gps_raw, "rt")
+    direct_sngm, direct_sngm_columns = _extract_direct_certificate_days(gps_raw, "sernageomin")
+    direct_dgmn, direct_dgmn_columns = _extract_direct_certificate_days(gps_raw, "dgmn")
+
     # Fallbacks de esquema: el backend ha usado distintas llaves para Lugar y
     # Fecha Retorno Operación. Se detectan por encabezado + contenido, sin alterar
     # la lógica del resto de campos.
@@ -597,6 +717,21 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
                 result.loc[fill_mask] = values.loc[fill_mask]
         gps_rows[field] = result
 
+    # Los contadores documentales detectados directamente en la fila RAW tienen
+    # prioridad sobre el mapeo difuso. Así RT/SNGM/DGMN permanecen como un trío
+    # coherente del mismo registro del sistema de planificación.
+    for field, direct in (
+        ("revision_tecnica_days", direct_rt),
+        ("sernageomin_days", direct_sngm),
+        ("dgmn_days", direct_dgmn),
+    ):
+        valid = direct.map(lambda value: parse_days_remaining(value) is not None)
+        if valid.any():
+            gps_rows.loc[valid, field] = direct.loc[valid]
+    gps_rows["_cert_rt_direct"] = direct_rt
+    gps_rows["_cert_sngm_direct"] = direct_sngm
+    gps_rows["_cert_dgmn_direct"] = direct_dgmn
+
     for column in ("_gps_type", "_gps_zone", "_gps_response_order"):
         if column in gps_raw.columns:
             gps_rows[column] = gps_raw[column]
@@ -628,9 +763,21 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
     # campo por campo todos sus registros válidos.
     consolidated: list[dict[str, Any]] = []
     rejected_numeric_status = 0
+    cert_day_fields = {"revision_tecnica_days", "sernageomin_days", "dgmn_days"}
     for identity, group in gps_rows.groupby("gps_identity_key", sort=False):
         record: dict[str, Any] = {"gps_identity_key": identity}
+        cert_row = _pick_certificate_row(group)
         for field in GPS_CANONICAL_FIELDS:
+            if field in cert_day_fields and cert_row is not None:
+                direct_field = {
+                    "revision_tecnica_days": "_cert_rt_direct",
+                    "sernageomin_days": "_cert_sngm_direct",
+                    "dgmn_days": "_cert_dgmn_direct",
+                }[field]
+                direct_value = cert_row.get(direct_field)
+                if parse_days_remaining(direct_value) is not None:
+                    record[field] = parse_days_remaining(direct_value)
+                    continue
             record[field] = _pick_gps_group_value(group, field)
         numeric_statuses = [
             value for value in group["status"].tolist()
@@ -690,6 +837,16 @@ def canonicalize_gps(gps_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any
         "gps_inferred_place_columns": inferred_place_columns,
         "gps_inferred_return_operation_columns": inferred_return_columns,
         "gps_inferred_certificate_columns": inferred_cert_columns,
+        "gps_direct_certificate_columns": {
+            "revision_tecnica_days": direct_rt_columns,
+            "sernageomin_days": direct_sngm_columns,
+            "dgmn_days": direct_dgmn_columns,
+        },
+        "gps_direct_certificate_values": {
+            "revision_tecnica_days": int(direct_rt.map(lambda v: parse_days_remaining(v) is not None).sum()),
+            "sernageomin_days": int(direct_sngm.map(lambda v: parse_days_remaining(v) is not None).sum()),
+            "dgmn_days": int(direct_dgmn.map(lambda v: parse_days_remaining(v) is not None).sum()),
+        },
     }
     return gps.reset_index(drop=True), diagnostics
 
