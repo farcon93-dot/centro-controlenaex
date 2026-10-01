@@ -498,13 +498,28 @@ def _infer_certificate_columns(gps_raw: pd.DataFrame, document: str) -> tuple[li
     doc = normalize_text(document)
     if doc == "rt":
         def matches(name: str) -> bool:
-            return bool(re.search(r"(^|\s)rt($|\s)", name)) or "revision tecnica" in name
+            compact = normalize_identifier(name)
+            return (
+                bool(re.search(r"(^|\s)rt($|\s)", name))
+                or "revision tecnica" in name
+                or "revisiontecnica" in compact
+                or "revtecnica" in compact
+                or "revtec" in compact
+                or compact in {"rt", "drt", "diasrt", "rtdias"}
+            )
     elif doc == "sernageomin":
         def matches(name: str) -> bool:
-            return "sernageomin" in name or bool(re.search(r"(^|\s)sngm($|\s)", name))
+            compact = normalize_identifier(name)
+            return (
+                "sernageomin" in compact
+                or "sngm" in compact
+                or "sgmn" in compact
+                or "sernageo" in compact
+            )
     else:
         def matches(name: str) -> bool:
-            return "dgmn" in name
+            compact = normalize_identifier(name)
+            return "dgmn" in compact or compact in {"dgm", "ddgm", "diasdgm"}
 
     day_candidates: list[tuple[float, str]] = []
     date_candidates: list[tuple[float, str]] = []
@@ -1042,23 +1057,20 @@ def build_planning_critical_certifications(
     today: pd.Timestamp | None = None,
     warning_days: int = 30,
 ) -> pd.DataFrame:
-    """Devuelve SOLO certificaciones amarillas/rojas del sistema de planificación.
+    """Alertas documentales tomadas SOLO del sistema de planificación/API.
 
-    Esta vista se construye directamente desde la API de planificación ya
-    canonicalizada (``gps``), sin depender del Excel ni de la categoría del
-    equipo. Por lo tanto incluye camiones fábrica, polvorines, auxiliares Enaex,
-    equipos en arriendo y cualquier otro equipo que reporte RT/Sernageomin/DGMN.
+    La fuente de verdad para esta vista son los contadores ``D: RT``,
+    ``D: Sernageomin`` y ``D: DGMN`` que muestra el dashboard de planificación.
+    No se usan fechas históricas del Excel como respaldo, porque pueden pertenecer
+    a renovaciones antiguas y generar falsos vencimientos.
 
-    Convención observada en el sistema:
-    - rojo: vencido (días < 0)
-    - amarillo: vence dentro de ``warning_days`` (0..30 por defecto)
-    - verde: más de ``warning_days``; no se muestra en alertas críticas
-
-    Registros sin valor/fecha válida se omiten, porque no representan una alerta
-    amarilla o roja del sistema de planificación.
+    Criterio del dashboard:
+    - rojo: días < 0
+    - amarillo: 0..``warning_days``
+    - verde: > ``warning_days`` (no se muestra)
     """
     columns = [
-        "equipment", "document", "expiration", "expiration_text",
+        "equipment_type", "equipment", "document", "expiration", "expiration_text",
         "days", "status", "priority", "faena", "place",
     ]
     if gps.empty:
@@ -1077,22 +1089,33 @@ def build_planning_critical_certifications(
         if not equipment_name:
             continue
         for document, date_field, days_field in docs:
-            expiration, days, _source = expiration_from_api(
-                row.get(date_field), row.get(days_field), today=today
-            )
+            # El dashboard pinta color según los días restantes. Por eso el valor
+            # numérico directo de la API tiene prioridad absoluta sobre una fecha.
+            days = parse_days_remaining(row.get(days_field))
+            expiration = None
+            if days is not None:
+                expiration = today + pd.Timedelta(days=days)
+            else:
+                # Algunos tipos de equipo pueden entregar solo una fecha explícita.
+                # Se acepta únicamente si viene de la misma API de planificación.
+                expiration = parse_date(row.get(date_field))
+                if expiration is not None:
+                    days = int((expiration - today).days)
+
             if days is None:
                 continue
             if days < 0:
                 status = "🔴 Vencida"
                 priority = 0
             elif days <= warning_days:
-                status = "🟡 Vence pronto"
-                priority = 1
+                status = "🟡 Vence pronto" if days > 0 else "🔴 Vence hoy"
+                priority = 1 if days > 0 else 0
             else:
                 continue
 
             rows.append(
                 {
+                    "equipment_type": certification_equipment_category(equipment_name),
                     "equipment": equipment_name,
                     "document": document,
                     "expiration": expiration,
@@ -1108,12 +1131,12 @@ def build_planning_critical_certifications(
     if not rows:
         return pd.DataFrame(columns=columns)
     result = pd.DataFrame(rows)
-    return result.sort_values(
+    result = result.sort_values(
         ["priority", "days", "equipment", "document"],
         ascending=[True, True, True, True],
         na_position="last",
-    ).reset_index(drop=True)
-
+    ).drop_duplicates(["equipment", "document"], keep="first")
+    return result.reset_index(drop=True)
 
 def build_critical_certifications_all_equipment(
     equipment: pd.DataFrame,

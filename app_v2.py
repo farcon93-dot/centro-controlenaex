@@ -44,7 +44,7 @@ def main() -> None:
         st.rerun()
 
     render_sidebar(data, ai_model, ai_error, refresh)
-    st.sidebar.caption("Entrypoint activo: app_v2.py · Build AUDIT-EN-PROCESO-V1")
+    st.sidebar.caption("Entrypoint activo: app_v2.py · Build CERT-API-DIRECT-V1")
 
     tab_alerts, tab_equipment, tab_movements, tab_faenas = st.tabs(
         ["🚨 Alertas", "🔍 Buscar Equipo", "📅 Movimientos de Equipos", "📍 Ver por Faena"]

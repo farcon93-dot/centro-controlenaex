@@ -1281,3 +1281,81 @@ def test_cross_audit_date_difference_uses_fecha_entrega_from_en_proceso() -> Non
     assert len(dates) == 1
     assert dates.iloc[0]["excel_return_date"] == "10/10/2026"
     assert int(dates.iloc[0]["date_difference_days"]) == 2
+
+
+
+def test_certifications_match_exported_planning_dashboard_examples() -> None:
+    """Valores reales de referencia del PDF exportado el 30-09-2026.
+
+    La alerta debe usar los contadores del sistema de planificación y no una
+    fecha histórica de certificación guardada en Excel.
+    """
+    from enaex.processing import build_planning_critical_certifications
+
+    today = pd.Timestamp("2026-09-30")
+    gps_raw = pd.DataFrame(
+        [
+            # Página 9: RT 140, SNGM -273, DGMN -289.
+            {"Equipo": "QUADRA-1007 AT Ex", "Faena": "Preparacion", "D: RT": 140, "D: Sernageomin": -273, "D: DGMN": -289},
+            # Página 9: RT 115, SNGM 90, DGMN 33 -> todo verde, no debe alertar.
+            {"Equipo": "QUADRA-92 AT Ex", "Faena": "Preparacion", "D: RT": 115, "D: Sernageomin": 90, "D: DGMN": 33},
+            # Página 7: RT -3, SNGM 29, DGMN 36.
+            {"Equipo": "QUADRA-1048 AT DEx", "Faena": "Los Pelambres", "D: RT": -3, "D: Sernageomin": 29, "D: DGMN": 36},
+            # Página 3: RT 125, SNGM 0, DGMN 368.
+            {"Equipo": "QUADRA-1060 AT Ex", "Faena": "Radomiro Tomic", "D: RT": 125, "D: Sernageomin": 0, "D: DGMN": 368},
+            # Página 7: RT 15, SNGM 243, DGMN 228.
+            {"Equipo": "QUADRA-1021 AT Ex", "Faena": "Andina", "D: RT": 15, "D: Sernageomin": 243, "D: DGMN": 228},
+        ]
+    )
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=today)
+    pairs = {(row.equipment, row.document): int(row.days) for row in critical.itertuples()}
+
+    assert pairs[("QUADRA-1007 AT Ex", "Sernageomin")] == -273
+    assert pairs[("QUADRA-1007 AT Ex", "DGMN")] == -289
+    assert not any(eq == "QUADRA-1007 AT Ex" and doc == "Revisión Técnica" for eq, doc in pairs)
+
+    assert not any(eq == "QUADRA-92 AT Ex" for eq, _doc in pairs)
+
+    assert pairs[("QUADRA-1048 AT DEx", "Revisión Técnica")] == -3
+    assert pairs[("QUADRA-1048 AT DEx", "Sernageomin")] == 29
+    assert ("QUADRA-1048 AT DEx", "DGMN") not in pairs
+
+    assert pairs[("QUADRA-1060 AT Ex", "Sernageomin")] == 0
+    assert pairs[("QUADRA-1021 AT Ex", "Revisión Técnica")] == 15
+
+
+def test_critical_certifications_ignore_old_excel_certificate_dates() -> None:
+    """Una fecha antigua del Excel no puede crear una alerta si API dice verde."""
+    from enaex.processing import build_planning_critical_certifications
+
+    excel = pd.DataFrame([
+        {
+            "Equipo": "QUADRA-92 AT Ex",
+            "DGMN": "11/03/2026",
+            "_source_file": "Excel_1",
+            "_source_sheet": "Historial",
+            "_source_row": 2,
+            "_global_order": 0,
+        }
+    ])
+    gps_raw = pd.DataFrame([
+        {"Equipo": "QUADRA-92 AT Ex", "Faena": "Preparacion", "D: RT": 115, "D: Sernageomin": 90, "D: DGMN": 33}
+    ])
+    data = build_application_data(excel, gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=pd.Timestamp("2026-09-30"))
+    assert critical.empty
+
+
+def test_certificate_header_variants_sgmn_and_revtec_are_detected() -> None:
+    from enaex.processing import build_planning_critical_certifications
+
+    gps_raw = pd.DataFrame([
+        {"Equipo": "AUX-1", "Faena": "Andina", "dias_revtec": 8, "dias_sgmn": 12, "dias_dgmn": 45}
+    ])
+    data = build_application_data(pd.DataFrame(), gps_raw, settings())
+    critical = build_planning_critical_certifications(data.gps, today=pd.Timestamp("2026-09-30"))
+    docs = dict(zip(critical["document"], critical["days"]))
+    assert int(docs["Revisión Técnica"]) == 8
+    assert int(docs["Sernageomin"]) == 12
+    assert "DGMN" not in docs

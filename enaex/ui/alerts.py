@@ -12,7 +12,7 @@ from enaex.processing import (
     CERT_POLVORIN_LABEL,
     CERT_RENTAL_LABEL,
     build_contracts,
-    build_critical_certifications_all_equipment,
+    build_planning_critical_certifications,
     build_cross_source_discrepancies,
 )
 from enaex.ui.common import render_contract_card
@@ -160,12 +160,13 @@ def render_alerts_page(
     st.divider()
     st.subheader("⚠️ Certificaciones críticas")
     st.caption(
-        "RT, Sernageomin y DGMN vencidas o con 30 días o menos. Se revisa toda la flota y se diferencia "
-        "entre camiones fábrica, polvorines, auxiliares Enaex y equipos en arriendo. Los documentos sin "
-        "fecha/días válidos no se muestran."
+        "RT, Sernageomin y DGMN que el sistema de planificación muestra en rojo o amarillo "
+        "(vencidas, vencen hoy o con 30 días o menos). Se revisa toda la flota y se diferencia "
+        "entre camiones fábrica, polvorines, auxiliares Enaex y equipos en arriendo. "
+        "Esta vista usa exclusivamente los días del sistema de planificación, no fechas históricas del Excel."
     )
 
-    critical = build_critical_certifications_all_equipment(data.equipment)
+    critical = build_planning_critical_certifications(data.gps)
     if critical.empty:
         if data.diagnostics.get("gps_partial_snapshot"):
             st.warning(
